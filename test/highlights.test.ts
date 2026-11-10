@@ -1,0 +1,384 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  HIGHLIGHTS_SCHEMA,
+  RANKING_SCHEMA,
+  TASTE_EXAMPLES,
+  batchClips,
+  findHighlights,
+  highlightsPrompt,
+  rankHighlights,
+  rankingPool,
+  rankingPrompt,
+  readHighlights,
+  readRanking,
+  snapToCues,
+  stamp,
+  tasteFrom,
+  vetSpeaker,
+  type HighlightClip,
+  type RankCandidate,
+  type ReviewedPick,
+} from "../src/server/highlights";
+import type { ClipLog } from "../src/server/footage";
+import { parseVtt } from "../src/shared/transcript";
+
+afterEach(() => vi.unstubAllGlobals());
+
+const log = (over: Partial<ClipLog> = {}): ClipLog => ({
+  summary: "A speaker talks about launching a product.",
+  kind: "interview",
+  quality: "good",
+  issues: "",
+  quotes: [],
+  moments: [],
+  visible_text: [],
+  ...over,
+});
+
+// Cues as the media service's transcript gives them: short lines with gaps.
+const VTT = `WEBVTT
+
+1
+00:00:01.200 --> 00:00:03.000
+So, um, where do I start.
+
+2
+00:00:03.400 --> 00:00:06.100
+Shipping fast is the whole point.
+
+3
+00:00:06.500 --> 00:00:09.800
+That's the whole reason we built it.
+
+4
+00:00:10.200 --> 00:00:12.000
+Anyway, next question.
+`;
+
+const interview: HighlightClip = { id: "c1", name: "A_0012.MP4", folder: "Day 1/Interview", duration: 20, log: log(), transcript: VTT };
+const broll: HighlightClip = {
+  id: "c2",
+  name: "B_0006.MP4",
+  folder: "Day 1/Cam B",
+  duration: 6.2,
+  log: log({ kind: "b-roll", summary: "Two men greet each other.", moments: [{ start: 0, end: 5.5, description: "Two men chatting" }] }),
+  transcript: null,
+};
+
+describe("stamp", () => {
+  it("writes clip positions the way the model reads them", () => {
+    expect(stamp(5.25)).toBe("0:05.3");
+    expect(stamp(313.8)).toBe("5:13.8");
+    expect(stamp(3723.4)).toBe("1:02:03.4");
+  });
+});
+
+describe("snapToCues", () => {
+  it("widens a soundbite to whole transcript lines, with a breath either side", () => {
+    // The model's times land inside lines 2 and 3.
+    expect(snapToCues(3.9, 8.0, parseVtt(VTT), 20)).toEqual({ start: 3.3, end: 10.1 });
+  });
+
+  it("leaves a stretch with no speech in it alone", () => {
+    expect(snapToCues(14, 16, [], 20)).toEqual({ start: 14, end: 16 });
+  });
+});
+
+describe("readHighlights", () => {
+  const answer = (clips: unknown[]) => ({ clips });
+
+  it("turns picks into seconds, snaps soundbites to the transcript, and drops what can't be read", () => {
+    const out = readHighlights(
+      answer([
+        {
+          clip: 1,
+          use: true,
+          skip_reason: "",
+          highlights: [
+            { kind: "soundbite", start: "0:03.9", end: "0:08.0", text: "Shipping fast is the whole point.", speaker: "woman in a green blazer", score: 5, reason: "the thesis in one line" },
+            { kind: "soundbite", start: "0:04.0", end: "0:05.0", text: "Overlaps the first.", speaker: "", score: 3, reason: "" },
+            { kind: "broll", start: "soon", end: "0:02", text: "Unreadable", speaker: "", score: 3, reason: "" },
+            { kind: "drone", start: "0:01", end: "0:02", text: "Unknown kind", speaker: "", score: 3, reason: "" },
+          ],
+        },
+        { clip: 2, use: true, skip_reason: "", highlights: [{ kind: "broll", start: "0:00", end: "0:09", text: "Two men chatting", speaker: "ignored", score: 9, reason: "warm" }] },
+        { clip: 7, use: true, skip_reason: "", highlights: [] },
+      ]),
+      [interview, broll],
+    );
+    expect(out).toEqual([
+      {
+        id: "c1",
+        skip: null,
+        highlights: [{ kind: "soundbite", start: 3.3, end: 10.1, text: "Shipping fast is the whole point.", speaker: "woman in a green blazer", score: 5, reason: "the thesis in one line" }],
+      },
+      // Clamped to the clip, score held to 1-5, no speaker on b-roll.
+      { id: "c2", skip: null, highlights: [{ kind: "broll", start: 0, end: 6.2, text: "Two men chatting", speaker: "", score: 5, reason: "warm" }] },
+    ]);
+  });
+
+  it("keeps a skipped clip's reason, and calls a clip with nothing left in it skipped", () => {
+    const out = readHighlights(
+      answer([
+        { clip: 1, use: false, skip_reason: "camera pointed at the ceiling", highlights: [] },
+        { clip: 2, use: true, skip_reason: "", highlights: [{ kind: "broll", start: "0:01.0", end: "0:01.4", text: "too short", speaker: "", score: 3, reason: "" }] },
+      ]),
+      [interview, broll],
+    );
+    expect(out.map((v) => v.skip)).toEqual(["camera pointed at the ceiling", "nothing worth picking"]);
+    expect(out.every((v) => v.highlights.length === 0)).toBe(true);
+  });
+
+  it("never picks again over what a person already reviewed", () => {
+    const reviewed = { ...interview, taken: [{ start: 3.3, end: 10.1, text: "Shipping", pick: "keep" as const }] };
+    const out = readHighlights(
+      answer([{ clip: 1, use: true, skip_reason: "", highlights: [{ kind: "soundbite", start: "0:03.4", end: "0:06.1", text: "Shipping…", speaker: "", score: 5, reason: "" }] }]),
+      [reviewed],
+    );
+    expect(out[0].highlights).toEqual([]);
+  });
+});
+
+describe("tasteFrom", () => {
+  const pick = (p: "keep" | "drop", text: string, extra: Partial<ReviewedPick> = {}): ReviewedPick => ({
+    pick: p,
+    kind: "soundbite",
+    text,
+    speaker: "",
+    score: 3,
+    origin: "ai",
+    ...extra,
+  });
+
+  it("leaves out a dropped take of a line that was kept, and keeps the rest in order", () => {
+    const t = tasteFrom([
+      pick("keep", "Shipping fast is the whole point."),
+      pick("drop", "shipping fast — is the whole point"),
+      pick("drop", "Um, so, yeah."),
+      pick("keep", "Logo wall", { kind: "broll", origin: "person" }),
+    ]);
+    expect(t.kept.map((e) => [e.text, e.own])).toEqual([["Shipping fast is the whole point.", false], ["Logo wall", true]]);
+    expect(t.dropped.map((e) => e.text)).toEqual(["Um, so, yeah."]);
+  });
+
+  it("never matches two picks on empty words, and stops at the bound", () => {
+    expect(tasteFrom([pick("keep", "..."), pick("drop", "!!")]).dropped).toHaveLength(1);
+    const many = Array.from({ length: 40 }, (_, i) => pick(i % 2 ? "drop" : "keep", `line ${i}`));
+    const t = tasteFrom(many);
+    expect([t.kept.length, t.dropped.length]).toEqual([TASTE_EXAMPLES, TASTE_EXAMPLES]);
+    expect(t.kept[0].text).toBe("line 0");
+  });
+});
+
+describe("batchClips", () => {
+  it("keeps a folder's neighbours together and puts a long interview on its own", () => {
+    const b = (id: string, folder: string, chars = 100): HighlightClip => ({ ...broll, id, folder, transcript: "x".repeat(chars) });
+    const batches = batchClips([b("1", "A"), b("2", "A"), b("3", "B"), b("4", "B", 41_000), b("5", "B")], { clips: 12, chars: 40_000 });
+    expect(batches.map((x) => x.map((c) => c.id))).toEqual([["1", "2"], ["3"], ["4"], ["5"]]);
+    expect(batchClips(Array.from({ length: 5 }, (_, i) => b(String(i), "A")), { clips: 2, chars: 40_000 }).map((x) => x.length)).toEqual([2, 2, 1]);
+  });
+});
+
+describe("highlightsPrompt", () => {
+  it("gives the brief, every clip's log and transcript, and the rules that matter", () => {
+    const p = highlightsPrompt("A 60 s sizzle of the booth", [interview, broll]);
+    expect(p).toContain("A 60 s sizzle of the booth");
+    expect(p).toContain('CLIP 1: "A_0012.MP4" in "Day 1/Interview", 20.0 s');
+    expect(p).toContain("[0:03.4-0:06.1] Shipping fast is the whole point.");
+    expect(p).toContain("CLIP 2:");
+    expect(p).toContain("No speech.");
+    expect(p).toMatch(/Flat or log colour[^.]*neither is a reason to skip/);
+    expect(p).toMatch(/so no word is cut/);
+  });
+
+  it("says what a person kept and dropped, on the clip and as a taste to learn from", () => {
+    const reviewed = { ...interview, taken: [{ start: 3.3, end: 6.1, text: "Shipping fast", pick: "keep" as const }, { start: 8, end: 9, text: "Um, so", pick: "drop" as const }] };
+    const p = highlightsPrompt("A sizzle", [reviewed], {
+      kept: [{ kind: "soundbite", text: "Shipping fast is the whole point.", speaker: "woman in green", score: 3, own: false }, { kind: "broll", text: "Logo wall", speaker: "", score: 3, own: true }],
+      dropped: [{ kind: "broll", text: "Crowd walking past", speaker: "", score: 4, own: false }],
+    });
+    expect(p).toContain("[0:03.3-0:06.1] kept: Shipping fast; [0:08.0-0:09.0] dropped: Um, so");
+    expect(p).toMatch(/Learn their taste from it/);
+    expect(p).toMatch(/the brief wins/);
+    expect(p).toContain('Kept:\n- soundbite, woman in green: "Shipping fast is the whole point." (scored 3 when proposed)\n- b-roll: "Logo wall" (added by them)');
+    expect(p).toContain('Dropped:\n- b-roll: "Crowd walking past" (scored 4 when proposed)');
+    // The taste comes before the clips, and nothing is said when there is none.
+    expect(p.indexOf("Kept:")).toBeLessThan(p.indexOf("CLIP 1:"));
+    expect(highlightsPrompt("A sizzle", [interview])).not.toMatch(/Learn their taste/);
+    expect(highlightsPrompt("A sizzle", [interview], { kept: [], dropped: [] })).not.toMatch(/Learn their taste/);
+  });
+
+  it("asks for every field it reads", () => {
+    const item = HIGHLIGHTS_SCHEMA.properties.clips.items;
+    expect(item.required).toEqual(["clip", "use", "skip_reason", "highlights"]);
+    expect(item.properties.highlights.items.required).toEqual(["kind", "start", "end", "text", "speaker", "score", "reason"]);
+  });
+});
+
+describe("findHighlights", () => {
+  it("says what is missing without a key, and asks again later when the model is busy", async () => {
+    expect(await findHighlights(undefined, "", [broll])).toMatchObject({ failure: { error: "highlights_unavailable", retry: false } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("rate limited", { status: 429 })));
+    expect(await findHighlights("k", "", [broll])).toMatchObject({ failure: { retry: true } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("bad request", { status: 400 })));
+    expect(await findHighlights("k", "", [broll])).toMatchObject({ failure: { retry: false } });
+  });
+
+  it("reads a structured answer", async () => {
+    const content = JSON.stringify({ clips: [{ clip: 1, use: true, skip_reason: "", highlights: [{ kind: "broll", start: "0:00", end: "0:05", text: "Two men chatting", speaker: "", score: 3, reason: "warm" }] }] });
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content } }] })));
+    vi.stubGlobal("fetch", fetch);
+    const r = await findHighlights("k", "brief", [broll]);
+    expect(r).toEqual({ verdicts: [{ id: "c2", skip: null, highlights: [{ kind: "broll", start: 0, end: 5, text: "Two men chatting", speaker: "", score: 3, reason: "warm" }] }] });
+    const body = JSON.parse((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.response_format.json_schema.strict).toBe(true);
+  });
+});
+
+describe("vetSpeaker", () => {
+  // A talk where nobody is named: the logger describes the speaker as seen.
+  const talk: HighlightClip = {
+    ...interview,
+    log: log({
+      summary: "A man in a red patterned shirt addresses colleagues, then draws on a whiteboard. Who is next?",
+      quotes: [{ start: 21.9, end: 25.4, text: "We're actually starting to wake up.", speaker: "man in a red patterned shirt" }],
+      visible_text: ["JUST SUCCEED"],
+    }),
+    transcript: "WEBVTT\n\n1\n00:00:21.900 --> 00:00:25.400\nWe're actually starting to wake up.\n",
+  };
+  // A testimonial where the speaker says who they are.
+  const intro: HighlightClip = {
+    ...talk,
+    log: log({ quotes: [{ start: 1, end: 3, text: "I'm Niraj, I build wallets.", speaker: "man in a white shirt" }] }),
+    transcript: "WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.000\nI'm Niraj, I build wallets.\n",
+  };
+
+  it("never keeps a name the clip doesn't bear out", () => {
+    expect(vetSpeaker("Some Famous Founder", 20.6, 25.9, talk)).toBe("man in a red patterned shirt");
+    expect(vetSpeaker("Some Famous Founder", 40, 45, talk)).toBe("man in a red patterned shirt");
+    // Matched as a whole word: "Ho" is not in "Who".
+    expect(vetSpeaker("Ho", 40, 45, talk)).toBe("man in a red patterned shirt");
+  });
+
+  it("keeps a name the clip says, shows or logs", () => {
+    expect(vetSpeaker("Niraj", 1, 3, intro)).toBe("Niraj");
+    const shown = { ...talk, log: { ...talk.log, visible_text: ["Ada Lovelace, CTO"] } };
+    expect(vetSpeaker("Ada Lovelace", 40, 45, shown)).toBe("Ada Lovelace");
+  });
+
+  it("prefers the logger's description to the model's, which never saw the clip", () => {
+    expect(vetSpeaker("Presenter in black shirt", 20.6, 25.9, talk)).toBe("man in a red patterned shirt");
+    expect(vetSpeaker("man at the whiteboard", 40, 45, talk)).toBe("man in a red patterned shirt");
+  });
+
+  it("falls back to nothing rather than a guess when the log names no speaker", () => {
+    expect(vetSpeaker("Famous Founder", 1, 2, { ...talk, log: log({ quotes: [] }), transcript: null })).toBe("");
+  });
+});
+
+// ── the best of them ──────────────────────────────────────────────────────
+
+const pickOf = (id: string, over: Partial<RankCandidate> = {}): RankCandidate => ({
+  id,
+  kind: "broll",
+  start: 10,
+  end: 14,
+  text: `Shot ${id}`,
+  speaker: "",
+  score: 3,
+  reason: "energy",
+  kept: false,
+  name: `${id}.MP4`,
+  folder: "Day 1/Cam B",
+  ...over,
+});
+
+describe("rankingPool", () => {
+  it("reads the kept picks and the best scored first, listed clip by clip", () => {
+    const all = [pickOf("c", { score: 2 }), pickOf("a", { score: 5 }), pickOf("b", { score: 1, kept: true }), pickOf("d", { score: 4 })];
+    expect(rankingPool(all).map((p) => p.id)).toEqual(["a", "b", "c", "d"]);
+    // A budget for about two lines: the kept one and the best scored.
+    const two = rankingPrompt("", [all[1], all[2]], 2, 1).split("\n").filter((l) => l.startsWith("PICK")).join("\n").length + 2;
+    expect(rankingPool(all, two).map((p) => p.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("rankingPrompt", () => {
+  const pool = [
+    pickOf("p1", { kind: "soundbite", text: "Shipping fast is the whole point.", speaker: "woman in a red jacket", score: 5, reason: "the thesis", name: "A_0012.MP4", folder: "Day 1/Interview" }),
+    pickOf("p2", { kept: true }),
+    pickOf("p3", { score: 4 }),
+  ];
+
+  it("gives the brief, the number, every pick, and lets the brief outrank spreading the picks", () => {
+    const p = rankingPrompt("A 60 s sizzle of the booth", pool, 10, 2);
+    expect(p).toMatch(/narrowing the selects for: A 60 s sizzle of the booth/);
+    expect(p).toMatch(/Choose the 2 that make the best set/);
+    expect(p).toMatch(/\(the 3 best scored of 10\)/);
+    expect(p).toMatch(/most of the set can come from that one clip/);
+    expect(p).toMatch(/never has the same moment twice/);
+    expect(p).toContain('PICK 1: soundbite, 5/5, "A_0012.MP4" in "Day 1/Interview" at 0:10.0, 4.0 s. woman in a red jacket: "Shipping fast is the whole point." Why: the thesis');
+    expect(p).toContain('PICK 2: b-roll, 3/5, KEPT, "p2.MP4" in "Day 1/Cam B" at 0:10.0, 4.0 s. Shot p2 Why: energy');
+    expect(p).toMatch(/up to 1 more as `reserve`/);
+  });
+
+  it("counts the kept picks in, and narrows them when there are more than the number", () => {
+    expect(rankingPrompt("", pool, 3, 2)).toMatch(/The 1 picks marked KEPT were kept by the person reviewing: they are in `best`. Choose the other 1 to go with them./);
+    const allKept = pool.map((p) => ({ ...p, kept: true }));
+    expect(rankingPrompt("", allKept, 3, 2)).toMatch(/kept 3 picks \(marked KEPT\), more than the 2 wanted: `best` is the best 2 of the kept picks/);
+  });
+
+  it("asks for both lists, as numbers", () => {
+    expect(RANKING_SCHEMA.required).toEqual(["best", "reserve"]);
+    expect(RANKING_SCHEMA.properties.best.items.type).toBe("integer");
+  });
+});
+
+describe("readRanking", () => {
+  it("places what the model chose, then its stand-ins, then the rest by score", () => {
+    const pool = [pickOf("a", { score: 2 }), pickOf("b", { score: 5 }), pickOf("c", { score: 3 }), pickOf("d", { score: 4 })];
+    expect(readRanking({ best: [3, 1], reserve: [2] }, pool, pool)).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("ignores numbers it doesn't know and repeats, and puts a line said twice at the back", () => {
+    const pool = [
+      pickOf("a", { kind: "soundbite", text: "We made it!", score: 5 }),
+      pickOf("b", { kind: "soundbite", text: "we made it", score: 5, folder: "Day 1/Cam C" }),
+      pickOf("c"),
+    ];
+    expect(readRanking({ best: [0, 9, 1.5, "x", 1, 1, 2], reserve: [3] }, pool, pool)).toEqual(["a", "c", "b"]);
+  });
+
+  it("gives a place to every candidate, the ones the prompt left out too", () => {
+    const pool = [pickOf("a"), pickOf("b")];
+    const all = [...pool, pickOf("z", { score: 1 }), pickOf("y", { score: 5 })];
+    expect(readRanking({ best: [2], reserve: [] }, pool, all)).toEqual(["b", "y", "a", "z"]);
+    expect(readRanking(null, pool, all)).toEqual(["y", "a", "b", "z"]);
+  });
+});
+
+describe("rankHighlights", () => {
+  const all = [pickOf("a", { score: 2 }), pickOf("b", { score: 5 }), pickOf("c")];
+
+  it("says what is missing without a key, and asks again later when the model is busy or says nothing", async () => {
+    expect(await rankHighlights(undefined, "", all, 1)).toMatchObject({ failure: { error: "highlights_unavailable", retry: false } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("rate limited", { status: 429 })));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: true } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("bad request", { status: 400 })));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: false } });
+    const empty = JSON.stringify({ best: [], reserve: [] });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: empty } }] }))));
+    expect(await rankHighlights("k", "", all, 1)).toMatchObject({ failure: { retry: true } });
+  });
+
+  it("orders every candidate from a structured answer", async () => {
+    // The pool lists the picks clip by clip: a, b, c.
+    const content = JSON.stringify({ best: [3], reserve: [1] });
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content } }] })));
+    vi.stubGlobal("fetch", fetch);
+    expect(await rankHighlights("k", "brief", all, 1)).toEqual({ order: ["c", "a", "b"] });
+    const body = JSON.parse((fetch.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+    expect(body.response_format.json_schema).toMatchObject({ name: "best_highlights", strict: true });
+    expect(body.messages[0].content).toMatch(/Choose the 1 that make the best set/);
+  });
+});

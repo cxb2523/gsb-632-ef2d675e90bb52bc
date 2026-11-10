@@ -1,0 +1,2617 @@
+import { reframing, readFraming, requestFraming } from "./reframe";
+import type { ClipDeps } from "./clips";
+import { parseVtt } from "../shared/transcript";
+import { backfillHighlights, libraryHighlights } from "./library-highlights";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+import { initDB, query, get, run } from "./db";
+import {
+  initUploads,
+  putUpload,
+  putUploadFromUrl,
+  deleteUpload,
+  serveUpload,
+  makeKey,
+} from "./uploads";
+import type { ConnectionsEnv } from "@clawnify/connections";
+import { verifyDelivery } from "@clawnify/queue";
+import {
+  deleteMedia,
+  frameUrl,
+  importMedia,
+  mediaPlayback,
+  mediaState,
+  mediaTranscript,
+  openMediaUpload,
+  prepareMedia,
+} from "./media";
+import {
+  DRIVE_FILE_ID,
+  SHARED_WITH_ME,
+  driveActionLink,
+  driveFileLink,
+  driveFilePiece,
+  driveFileSize,
+  driveRemove,
+  driveFolderName,
+  driveStatus,
+  driveImportSource,
+  listDriveFiles,
+  withinFolder,
+} from "./drive";
+import { createImport, listImports, readImport, importView, cancelImport, retryImport, stepImport, ImportError } from "./drive-imports";
+import { parseDriveLink, type FolderVideo } from "./drive-link";
+import { addFolderVideos, bookStep, readFolder, removeCopy, stepFootage, type DriveSource, type StepOutcome } from "./footage";
+import { HIGHLIGHTS_NO_KEY, MAX_WANTED, highlightsPending, rankingDue, stepHighlights, type HighlightKind } from "./highlights";
+import { highlightsCsv, highlightsXml, rateOf } from "./nle";
+import { starterEdl, validateEdl, type Edl } from "./edl";
+import { findFormat, renderDoc } from "../shared/formats";
+import { isAbandonedExport, renderKey, renderKeyFor } from "../shared/renders";
+import { HISTORY_TURNS, QUICK_WATCH_SECONDS, instructEdit, type Assembler, type InstructContext, type InstructHighlight, type InstructTurn, type InstructVideo } from "./instruct";
+import { applyKept, bookJob, createJob, dropProposals, jobView, listJobs, proposalText, recordQuick, revertJob, reviveJobs, runJobStep, unchanged, type AskJobRow, type JobDeps } from "./ask-jobs";
+import { caller, user } from "@clawnify/app";
+import { analyzeAsset, autocutAssets, autocutEdl, copyOutput, pollEdit, resolveEdlSources, startEdit, type ExportConfig, type ExportFailure } from "./export";
+import { makeShareToken, notePage, sharePage } from "./share";
+import { COMMENTS_PER_MINUTE, MAX_PROJECT_COMMENTS, parseComment, type PublicComment } from "./comments";
+
+type Bindings = {
+  DB: D1Database;
+  UPLOADS: R2Bucket;
+  // Injected into every WfP app at deploy time; authorizes managed services.
+  CLAWNIFY_TOKEN?: string;
+  // Override for local dev (defaults to https://services.clawnify.com).
+  SERVICES_URL?: string;
+  // The org's OpenRouter key (declared in clawnify.json `env`, injected at
+  // deploy) — powers footage analysis; usage bills the org's own metering.
+  OPENROUTER_API_KEY?: string;
+  // Injected because clawnify.json lists `credentials`: the org's connected
+  // integrations (Google Drive import) and which org this app serves.
+  CREDENTIALS?: ConnectionsEnv["CREDENTIALS"];
+  CLAWNIFY_ORG_ID?: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+const init: MiddlewareHandler<{ Bindings: Bindings }> = async (c, next) => {
+  initDB(c.env);
+  initUploads(c.env.UPLOADS);
+  await next();
+};
+app.use("/api/*", init);
+app.use("/s/*", init);
+app.route("/api/highlights", libraryHighlights);
+app.route("/api/reframe", reframing);
+
+app.onError((err, c) => {
+  if (err.message.includes("source_unavailable")) return c.json({ error: "source_unavailable", detail: "A video in this edit was removed or is being deleted. Refresh the library before saving." }, 409);
+  console.error(err);
+  return c.json({ error: err.message || String(err) }, 500);
+});
+
+// ── Assets (media library) ───────────────────────────────────────────
+
+interface Asset {
+  id: string;
+  key: string;
+  name: string;
+  content_type: string;
+  size: number;
+  created_at: string;
+  /** Seconds, probed at upload or reported by the media service. */
+  duration: number | null;
+  /** Set when the footage lives on the media service rather than in storage. */
+  media_uid: string | null;
+  deleting: number;
+}
+
+app.get("/api/assets", async (c) => {
+  // Footage a project took from a Drive folder is that project's own: it is
+  // listed only with ?project=<its id>, never in the library at large.
+  const rows = await query<Asset>(
+    `SELECT * FROM assets a
+      WHERE NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive' AND f.project_id IS NOT ?)
+         OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL)
+         OR EXISTS (SELECT 1 FROM edit_projects p, json_tree(p.edl) j WHERE p.id = ? AND j.key = 'src' AND j.value = 'asset:' || a.id)
+      ORDER BY created_at DESC`,
+    [c.req.query("project") ?? null, c.req.query("project") ?? null],
+  );
+  c.executionCtx.waitUntil(sweepUploads(c.env).catch((err) => console.error("upload sweep:", String(err))));
+  return c.json(rows);
+});
+
+app.post("/api/assets", async (c) => {
+  const body = await c.req.parseBody();
+  const file = body["file"];
+  if (!file || typeof file === "string") return c.json({ error: "No file provided" }, 400);
+
+  const key = await uniqueKey(file.name);
+  const data = await file.arrayBuffer();
+  const contentType = file.type || "application/octet-stream";
+  await putUpload(key, data, contentType);
+
+  // Client-probed media length (seconds) — see schema note on assets.duration.
+  const durRaw = Number(body["duration"]);
+  const duration = Number.isFinite(durRaw) && durRaw > 0 ? durRaw : null;
+
+  const res = await run(
+    "INSERT INTO assets (key, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)",
+    [key, file.name || key, contentType, data.byteLength, duration],
+  );
+  const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+  return c.json(row, 201);
+});
+
+// ── Video uploads, straight to the media service ──────────────────
+// A video is not posted to this app: the browser sends it to the media
+// service itself, resumably, so a clip of any size uploads and gets the same
+// playback, frames and transcript as one imported from Drive. Three steps:
+// open an upload, send the bytes (browser to service), then register the
+// asset.
+//
+// Each open upload has a `media_uploads` row from the moment it is opened
+// until it becomes an asset or is dropped. The row is the app's proof that the
+// video is its own, so a cancel or a discard can delete it at any stage, and
+// an upload whose browser went away is still settled: a finished one joins
+// the library, an expired one is deleted (sweepUploads).
+
+const MEDIA_UID = /^[0-9a-f]{32}$/;
+
+interface MediaUpload {
+  uid: string;
+  name: string;
+  content_type: string;
+  size: number;
+  duration: number | null;
+  created_at: string;
+}
+
+function mediaCfg(env: Bindings) {
+  return { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN };
+}
+
+/** Turn an open upload into a library asset. Safe to call twice: the asset key is unique. */
+async function promoteUpload(uid: string): Promise<Asset | null> {
+  await run(
+    `INSERT INTO assets (key, name, content_type, size, duration, media_uid)
+     SELECT 'media/' || uid, name, content_type, size, duration, uid FROM media_uploads WHERE uid = ?
+     ON CONFLICT(key) DO NOTHING`,
+    [uid],
+  );
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
+  return (await get<Asset>("SELECT * FROM assets WHERE media_uid = ?", [uid])) ?? null;
+}
+
+// An upload link lives 6 hours on the service; past that, a pending upload
+// can never finish.
+const UPLOAD_SETTLE_MINUTES = 10;
+const UPLOAD_EXPIRED_HOURS = 7;
+
+/**
+ * Settle uploads the browser never finished registering (closed tab, lost
+ * connection). Left alone, a finished one would count against the org's
+ * footage allowance while appearing nowhere. Runs after a library listing,
+ * a few rows at a time, and only for rows old enough that no browser is
+ * still working on them.
+ */
+async function sweepUploads(env: Bindings): Promise<void> {
+  const stale = await query<MediaUpload>(
+    `SELECT * FROM media_uploads u WHERE created_at < datetime('now', ?)
+     AND NOT EXISTS (SELECT 1 FROM drive_imports j WHERE j.upload_uid=u.uid)
+     ORDER BY created_at LIMIT 5`,
+    [`-${UPLOAD_SETTLE_MINUTES} minutes`],
+  );
+  for (const up of stale) {
+    const state = await mediaState(mediaCfg(env), up.uid);
+    if ("failure" in state) {
+      if (state.failure.error === "not_found") await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+      continue;
+    }
+    if (state.media.state !== "pendingupload") {
+      await promoteUpload(up.uid);
+    } else if (Date.parse(up.created_at + "Z") < Date.now() - UPLOAD_EXPIRED_HOURS * 3600_000) {
+      // Not deleted on the service: kept, and tried again on the next sweep.
+      if (!(await deleteMedia(mediaCfg(env), up.uid).then(() => true, () => false))) continue;
+      await run("DELETE FROM media_uploads WHERE uid = ?", [up.uid]);
+    }
+  }
+}
+
+app.post("/api/assets/uploads", async (c) => {
+  const b = await c.req
+    .json<{ name?: string; type?: string; size?: number; duration?: number }>()
+    .catch(() => ({}) as { name?: string; type?: string; size?: number; duration?: number });
+  if (!b.name || !b.size || !Number.isInteger(b.size) || b.size <= 0) {
+    return c.json({ error: "invalid_request", detail: "name and size are required" }, 400);
+  }
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+  // Until it completes, an upload reserves its maximum length of the
+  // platform's video storage (released when the link expires). The browser
+  // read the real length from the file, so reserve that, with room for a
+  // probe that is a little short: a video longer than this is refused.
+  const maxDuration = duration ? Math.ceil(duration * 1.1 + 30) : undefined;
+  const name = b.name.slice(0, 200);
+  const opened = await openMediaUpload(mediaCfg(c.env), b.size, name, maxDuration);
+  // media_unavailable (local dev) tells the browser to post the file here instead.
+  if ("failure" in opened) return c.json(opened.failure, opened.failure.error === "media_unavailable" ? 503 : 422);
+  await run("INSERT INTO media_uploads (uid, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)", [
+    opened.id,
+    name,
+    b.type?.startsWith("video/") ? b.type : "video/mp4",
+    b.size,
+    duration,
+  ]);
+  return c.json({ uid: opened.id, upload_url: opened.uploadUrl }, 201);
+});
+
+// The bytes are in: the upload joins the library.
+app.post("/api/assets/media", async (c) => {
+  const b = await c.req.json<{ uid?: string }>().catch(() => ({}) as { uid?: string });
+  if (!b.uid || !MEDIA_UID.test(b.uid)) return c.json({ error: "invalid_request", detail: "uid is required" }, 400);
+  if (await get("SELECT 1 FROM drive_imports WHERE upload_uid=?", [b.uid])) return c.json({ error: "This upload belongs to a Drive import." }, 409);
+  const asset = await promoteUpload(b.uid);
+  if (!asset) return c.json({ error: "not_found", detail: "no upload with that id was opened here" }, 404);
+  return c.json(asset, 201);
+});
+
+// Cancel or discard an upload that has not joined the library, at any stage.
+// Only one this app opened: footage in the library goes through
+// DELETE /api/assets/:id, which checks the projects first.
+app.delete("/api/assets/uploads/:uid", async (c) => {
+  const uid = c.req.param("uid");
+  if (await get("SELECT 1 FROM drive_imports WHERE upload_uid=?", [uid])) return c.json({ error: "Cancel this upload from its Drive import." }, 409);
+  if (!MEDIA_UID.test(uid) || !(await get<MediaUpload>("SELECT uid FROM media_uploads WHERE uid = ?", [uid]))) {
+    return c.json({ error: "not_found", detail: "no open upload with that id" }, 404);
+  }
+  try {
+    await deleteMedia(mediaCfg(c.env), uid);
+  } catch (e) {
+    return c.json({ error: "delete_failed", detail: `the upload could not be deleted from storage, try again: ${(e as Error).message}` }, 502);
+  }
+  await run("DELETE FROM media_uploads WHERE uid = ?", [uid]);
+  return c.json({ ok: true });
+});
+
+// ── Google Drive (a source for the media library) ──────────────────
+// Import copies the file in, like an upload; see src/server/drive.ts.
+
+/** The folder the org limited the picker to, or null for the whole Drive. */
+async function driveFolder(): Promise<{ id: string; name: string } | null> {
+  const row = await get<{ value: string }>("SELECT value FROM app_settings WHERE key = 'drive_folder'");
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.value) as { id?: string; name?: string };
+    return parsed.id ? { id: parsed.id, name: parsed.name || "Drive folder" } : null;
+  } catch {
+    return null;
+  }
+}
+
+app.get("/api/drive", async (c) => c.json({ ...(await driveStatus(c.env)), folder: await driveFolder() }));
+
+// Limit the picker to one folder, or clear the limit with `null`. Anyone in
+// the org can set it: an app sees who is calling, never their role.
+app.put("/api/drive/folder", async (c) => {
+  const b = await c.req.json<{ folderId?: string | null }>().catch(() => ({}) as { folderId?: string | null });
+  if (b.folderId === null) {
+    await run("DELETE FROM app_settings WHERE key = 'drive_folder'");
+    return c.json({ folder: null });
+  }
+  if (!b.folderId || !DRIVE_FILE_ID.test(b.folderId)) return c.json({ error: "folderId is required" }, 400);
+  const name = await driveFolderName(c.env, b.folderId);
+  if (!name) return c.json({ error: "no such folder in Drive" }, 404);
+  const folder = { id: b.folderId, name };
+  await run(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ('drive_folder', ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [JSON.stringify(folder)],
+  );
+  return c.json({ folder });
+});
+
+app.get("/api/drive/files", async (c) => {
+  const kind = c.req.query("kind") === "audio" ? "audio" : "media";
+  const limit = await driveFolder();
+  const asked = c.req.query("folder");
+  // Outside the limit, fall back to it rather than serving the wider Drive.
+  let folderId = asked && DRIVE_FILE_ID.test(asked) ? asked : limit?.id;
+  // A limit means one folder and its subfolders: shared-with-me is not in it.
+  if (limit && folderId !== limit.id && (folderId === SHARED_WITH_ME || !(await withinFolder(c.env, folderId!, limit.id)))) {
+    folderId = limit.id;
+  }
+  return c.json({
+    ...(await listDriveFiles(c.env, {
+      kind,
+      search: c.req.query("q"),
+      pageToken: c.req.query("page") || undefined,
+      folderId,
+    })),
+    folder: folderId && limit && folderId !== limit.id ? { id: folderId } : null,
+  });
+});
+
+app.post("/api/drive/import", async (c) => {
+  const b = await c.req.json<{ fileId?: string; duration?: number }>().catch(() => ({}) as { fileId?: string; duration?: number });
+  if (!b.fileId || !DRIVE_FILE_ID.test(b.fileId)) return c.json({ error: "fileId is required" }, 400);
+
+  const limit = await driveFolder();
+  if (limit && !(await withinFolder(c.env, b.fileId, limit.id))) {
+    return c.json({ error: `that file is outside ${limit.name}` }, 403);
+  }
+
+  try {
+    const source = await driveImportSource(c.env, b.fileId);
+    if (source.mimeType.startsWith("video/")) {
+      return c.json({ import: await createImport(c.env, new URL(c.req.url).origin, source) }, 202);
+    }
+  } catch (e) {
+    if (e instanceof ImportError) return c.json({ error: e.code, detail: e.message }, e.code === "queue_unavailable" ? 503 : 422);
+    return c.json({ error: "import_unavailable", detail: "Could not start the import. Check your Drive connection and try again." }, 503);
+  }
+
+  // Images and audio keep the existing synchronous import contract.
+  // Through the connection's Drive API. A file over what one answer carries
+  // (250 MB) takes the broker's download action instead: nothing here reads
+  // a library import in pieces.
+  const link = await driveFileLink(c.env, b.fileId);
+  const file = "tooBig" in link ? await driveActionLink(c.env, b.fileId) : link;
+
+  // A video goes to the media service: it fetches the link itself, so nothing
+  // passes through this app and no size ceiling applies. Stills and sound are
+  // small, and stay in the app's own storage.
+  if (file.mimeType.startsWith("video/")) {
+    const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+    const imported = await importMedia(cfg, file.url, file.name);
+    if ("failure" in imported) return c.json(imported.failure, 422);
+    const res = await run(
+      "INSERT INTO assets (key, name, content_type, size, duration, media_uid) VALUES (?, ?, ?, ?, ?, ?)",
+      [`media/${imported.media.id}`, file.name, file.mimeType, 0, b.duration ?? null, imported.media.id],
+    );
+    const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+    return c.json(row, 201);
+  }
+
+  const key = await uniqueKey(file.name);
+  const stored = await putUploadFromUrl(file.url, key, file.mimeType);
+  // Drive's own probe of the video length, when the picker had it.
+  const duration = typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0 ? b.duration : null;
+
+  const res = await run(
+    "INSERT INTO assets (key, name, content_type, size, duration) VALUES (?, ?, ?, ?, ?)",
+    [key, file.name, stored.contentType, stored.size, duration],
+  );
+  const row = await get<Asset>("SELECT * FROM assets WHERE rowid = ?", [res.lastInsertRowid]);
+  return c.json(row, 201);
+});
+
+app.get("/api/drive/imports", async (c) => c.json({ imports: await listImports(c.env, new URL(c.req.url).origin) }));
+app.get("/api/drive/imports/:id", async (c) => {
+  const row = await readImport(c.req.param("id"));
+  return row ? c.json(importView(row)) : c.json({ error: "not_found" }, 404);
+});
+app.post("/api/drive/imports/:id/cancel", async (c) => {
+  const row = await cancelImport(c.env, new URL(c.req.url).origin, c.req.param("id"));
+  return row ? c.json(row) : c.json({ error: "not_found" }, 404);
+});
+app.post("/api/drive/imports/:id/retry", async (c) => {
+  try {
+    const row = await retryImport(c.env, new URL(c.req.url).origin, c.req.param("id"));
+    return row ? c.json(row) : c.json({ error: "not_found" }, 404);
+  } catch (e) {
+    return c.json({ error: e instanceof ImportError ? e.code : "retry_unavailable", detail: e instanceof ImportError ? e.message : "The previous upload is still being cleaned up. Try again shortly." }, 409);
+  }
+});
+// Public only at the perimeter. No transfer or state access without a valid
+// queue signature; the signature covers the whole body and expires in minutes.
+app.post("/api/drive/imports/step", async (c) => {
+  const raw = await c.req.text();
+  if (!(await verifyDelivery(raw, { signature: c.req.header("X-Queue-Signature"), timestamp: c.req.header("X-Queue-Timestamp"), keyId: c.req.header("X-Queue-Key-Id") }))) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const body = JSON.parse(raw) as { import_id?: unknown };
+  if (typeof body.import_id !== "string") return c.json({ error: "invalid_request" }, 400);
+  await stepImport(c.env, new URL(c.req.url).origin, body.import_id);
+  return c.json({ ok: true });
+});
+
+/**
+ * Where to play a media-backed asset from, and where its frames come from.
+ * The URLs are signed and short-lived, so the client asks again rather than
+ * storing them.
+ */
+app.get("/api/assets/:id/playback", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset.media_uid) return c.json({ error: "not_media", detail: "this asset plays from app storage" }, 400);
+
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const state = await mediaState(cfg, asset.media_uid);
+  if ("failure" in state) return c.json(state.failure, 502);
+  if (!state.media.ready) {
+    return c.json({ ready: false, state: state.media.state, progress: state.media.progress });
+  }
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  // The MP4 the edit service cuts from is made only on request, so ask for it
+  // the moment the clip can play: by the time someone exports or analyses it,
+  // it is usually ready, instead of the first attempt failing.
+  if (state.media.download?.status !== "ready" && state.media.download?.status !== "inprogress") {
+    c.executionCtx.waitUntil(prepareMedia(cfg, asset.media_uid).then(() => {}));
+  }
+  // The length the service measured beats the one the picker guessed.
+  if (state.media.duration && Math.abs((asset.duration ?? 0) - state.media.duration) > 0.5) {
+    await run("UPDATE assets SET duration = ? WHERE id = ?", [state.media.duration, asset.id]);
+  }
+  // The source's own frame size, for the format picker's "Original" choices.
+  return c.json({
+    ready: true,
+    duration: state.media.duration,
+    width: state.media.width,
+    height: state.media.height,
+    ...play.playback,
+  });
+});
+
+/**
+ * Where an asset's bytes are, whichever side they live on. A redirect keeps
+ * one URL shape for the whole client, and the range requests a video element
+ * makes survive it.
+ */
+app.get("/api/assets/:id/source", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset) return c.json({ error: "Not found" }, 404);
+  if (!asset.media_uid) return c.redirect(`/api/uploads/${encodeURIComponent(asset.key)}`, 302);
+
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  return c.redirect(play.playback.download, 302);
+});
+
+/**
+ * A clip's transcript, for captions. Asks the media service for it in `lang`
+ * and keeps it once ready. Footage in app storage has none: only the media
+ * service transcribes.
+ */
+app.get("/api/assets/:id/transcript", async (c) => {
+  const asked = c.req.query("lang") ?? "en";
+  const lang = /^[a-z]{2}(-[A-Z]{2})?$/.test(asked) ? asked : "en";
+  const out = await assetTranscript(c.env, c.req.param("id"), lang);
+  return "code" in out ? c.json(out.body, out.code) : c.json(out);
+});
+
+type TranscriptState =
+  | { status: "ready" | "no_speech"; vtt: string }
+  | { status: "unavailable" | "preparing" | "transcribing" }
+  | { code: 404 | 502; body: unknown };
+
+/** A video's transcript in `lang`, asked for the first time it is wanted and kept once ready. */
+async function assetTranscript(env: Bindings, assetId: string, lang: string): Promise<TranscriptState> {
+  const asset = await get<Asset & { transcript: string | null; transcript_lang: string | null }>(
+    "SELECT * FROM assets WHERE id = ?",
+    [assetId],
+  );
+  if (!asset) return { code: 404, body: { error: "Not found" } };
+
+  if (asset.transcript !== null && asset.transcript_lang === lang) {
+    return { status: asset.transcript ? "ready" : "no_speech", vtt: asset.transcript };
+  }
+  if (!asset.media_uid) return { status: "unavailable" };
+
+  const cfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN };
+  // Idempotent: asks for the transcript the first time, reports on it after.
+  const prepared = await prepareMedia(cfg, asset.media_uid, lang);
+  if ("failure" in prepared) {
+    if (prepared.failure.error === "not_ready") return { status: "preparing" };
+    return { code: 502, body: prepared.failure };
+  }
+  if (prepared.media.no_audio) {
+    await run("UPDATE assets SET transcript = '', transcript_lang = ? WHERE id = ?", [lang, asset.id]);
+    return { status: "no_speech", vtt: "" };
+  }
+  const vtt = await mediaTranscript(cfg, asset.media_uid, lang);
+  if (vtt === null) return { status: "transcribing" };
+  await run("UPDATE assets SET transcript = ?, transcript_lang = ? WHERE id = ?", [vtt, lang, asset.id]);
+  return { status: "ready", vtt };
+}
+
+/** One frame of a media-backed asset, for covers and the timeline. */
+app.get("/api/assets/:id/frame", async (c) => {
+  const asset = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!asset?.media_uid) return c.json({ error: "Not found" }, 404);
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+  const play = await mediaPlayback(cfg, asset.media_uid);
+  if ("failure" in play) return c.json(play.failure, 502);
+  const at = Number(c.req.query("t") ?? 0);
+  return c.redirect(frameUrl(play.playback, Number.isFinite(at) ? at : 0), 302);
+});
+
+// Backfill a probed duration onto a legacy asset (self-healing library).
+app.patch("/api/assets/:id", async (c) => {
+  const b = await c.req.json<{ duration?: number }>().catch(() => ({}) as { duration?: number });
+  if (typeof b.duration === "number" && Number.isFinite(b.duration) && b.duration > 0) {
+    await run("UPDATE assets SET duration = ? WHERE id = ? AND duration IS NULL", [
+      b.duration,
+      c.req.param("id"),
+    ]);
+  }
+  const row = await get<Asset>("SELECT * FROM assets WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(row);
+});
+
+app.delete("/api/assets/:id", async (c) => {
+  await backfillHighlights();
+  const row = await get<Asset & { proxy_key?: string | null }>("SELECT * FROM assets WHERE id = ?", [
+    c.req.param("id"),
+  ]);
+  if (row) {
+    // Deleting footage a project still uses would leave that project with a
+    // clip pointing at nothing, which fails at export. Say where it is used.
+    const users = await query<{ name: string }>(
+      `SELECT name FROM edit_projects p WHERE edl LIKE ? OR EXISTS
+        (SELECT 1 FROM project_footage f WHERE f.project_id = p.id AND f.source_kind = 'library' AND f.asset_id = ? AND f.status != 'removed')`,
+      [`%"asset:${row.id}"%`, row.id],
+    );
+    if (users.length > 0) {
+      return c.json(
+        {
+          error: "in_use",
+          detail: `Still used in ${users.map((u) => `"${u.name}"`).join(", ")}. Remove it from ${users.length > 1 ? "those projects" : "that project"} first.`,
+        },
+        409,
+      );
+    }
+    if (await get("SELECT 1 FROM library_highlights WHERE asset_id = ? AND deleted_at IS NULL LIMIT 1", [row.id])) {
+      return c.json({ error: "in_use", detail: "Still used by shared Highlights. Remove those highlights before deleting this video." }, 409);
+    }
+    // Atomically exclude new library references before external deletion.
+    // Leave the intent on a failed cleanup: retry DELETE to finish it.
+    const claimed = await run(`UPDATE assets SET deleting = 1 WHERE id = ?
+      AND NOT EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = assets.id AND h.deleted_at IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = assets.id AND f.source_kind = 'library' AND f.status != 'removed')
+      AND NOT EXISTS (SELECT 1 FROM edit_projects WHERE edl LIKE ?)`, [row.id, `%"asset:${row.id}"%`]);
+    if (!claimed.changes) return c.json({ error: "in_use", detail: "This video was added to a project. Remove it from that project before deleting it." }, 409);
+    // Footage on the media service counts against the org's storage minutes
+    // until it is deleted there; dropping only our row left it counting.
+    if (row.media_uid) {
+      // Not deleted on the service: the asset stays, so deleting it again
+      // finishes the job, instead of an ok that leaves the copy counting.
+      try {
+        await deleteMedia({ servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN }, row.media_uid);
+      } catch (e) {
+        return c.json({ error: "delete_failed", detail: `the video could not be deleted from storage, try again: ${(e as Error).message}` }, 502);
+      }
+    } else {
+      await deleteUpload(row.key);
+    }
+    if (row.proxy_key) await deleteUpload(row.proxy_key);
+    await run("DELETE FROM assets WHERE id = ?", [row.id]);
+    // A clip from a project's Drive folder stays listed as removed, so
+    // checking the folder for new files does not bring it back.
+    await run(
+      "UPDATE project_footage SET status = 'removed', asset_id = NULL, updated_at = datetime('now') WHERE asset_id = ?",
+      [row.id],
+    );
+  }
+  return c.json({ ok: true });
+});
+
+// AI footage analysis: a multimodal model watches the clip and proposes cuts
+// (millisecond timestamps, keep flags) and caption lines — raw material for
+// EDL edits. See agent.md ("Analyzing footage").
+app.post("/api/assets/:id/analyze", async (c) => {
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json(
+      { error: "Analysis service not configured (missing CLAWNIFY_TOKEN). Analysis runs on deployed apps." },
+      503,
+    );
+  }
+  const b = (await c.req.json<{ mode?: string; prompt?: string; window?: { start?: number; end?: number } }>().catch(() => ({}))) as {
+    mode?: string;
+    prompt?: string;
+    window?: { start?: number; end?: number };
+  };
+  // The part of the source the clip plays now, so proposals stay inside it.
+  const w = b.window;
+  const window =
+    w && Number.isFinite(w.start) && Number.isFinite(w.end) && (w.end as number) > (w.start as number)
+      ? { start: Math.max(0, w.start as number), end: w.end as number }
+      : undefined;
+  const res = await analyzeAsset(
+    c.req.param("id"),
+    { mode: b.mode, prompt: b.prompt, window },
+    {
+      servicesUrl: c.env.SERVICES_URL,
+      token: c.env.CLAWNIFY_TOKEN,
+      openrouterKey: c.env.OPENROUTER_API_KEY,
+    },
+  );
+  if ("failure" in res) return c.json(res.failure, 422);
+  return c.json(res.result);
+});
+
+// Serve any R2 object (uploaded media + exported videos), range-aware.
+app.get("/api/uploads/:key", async (c) => {
+  const res = await serveUpload(c.req.param("key"), c.req.header("Range"), {
+    "Cache-Control": "public, max-age=31536000",
+  });
+  return res ?? c.json({ error: "Not found" }, 404);
+});
+
+// ── Edit projects (footage EDL) ──────────────────────────────────────
+// A project's document is an EDL: real footage cut/trimmed/sequenced on a
+// main track, with overlay and audio tracks. See agent.md for the format.
+
+interface EditProject {
+  id: string;
+  name: string;
+  edl: string;
+  brief: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ExportJob {
+  id: number;
+  project_id: string;
+  status: string;
+  output_url: string | null;
+  error: string | null;
+  duration: number | null;
+  size: number | null;
+  /** The render's job on the edit service; null until it is submitted. */
+  service_job_id: string | null;
+  /** Which of the project's formats it renders: a ratio such as "9:16", or null for the main one. */
+  format: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Project row with the EDL parsed for the response. */
+function projectOut(row: EditProject) {
+  return { ...row, edl: JSON.parse(row.edl) as Edl };
+}
+
+app.get("/api/projects", async (c) => {
+  // The first main-track clip is the project's cover: the frame a list of cuts
+  // is recognised by. `substr(…, 7)` strips the "asset:" prefix; a URL source
+  // matches no asset id and simply has no cover.
+  const rows = await query<
+    Omit<EditProject, "edl" | "brief"> & { cover_key: string | null; cover_type: string | null; cover_at: number | null }
+  >(
+    `SELECT p.id, p.name, p.created_at, p.updated_at,
+            (SELECT COUNT(*) FROM project_footage f WHERE f.project_id = p.id AND f.status != 'removed') AS footage,
+            (SELECT json_group_array(v.id) FROM edit_projects v WHERE v.parent_id = p.id) AS video_ids,
+            a.key AS cover_key, a.content_type AS cover_type,
+            a.id AS cover_asset, a.media_uid AS cover_media,
+            json_extract(p.edl, '$.main.elements[0].trimStart') AS cover_at
+       FROM edit_projects p
+       LEFT JOIN assets a ON a.id = substr(json_extract(p.edl, '$.main.elements[0].src'), 7)
+      WHERE p.parent_id IS NULL
+      ORDER BY p.updated_at DESC`,
+  );
+  // A project's other videos live inside it, not in this list.
+  return c.json(rows.map((r) => {
+    const ids = JSON.parse((r as { video_ids?: string }).video_ids ?? "[]") as string[];
+    return { ...r, video_ids: ids, videos: ids.length + 1 };
+  }));
+});
+
+app.get("/api/projects/:id", async (c) => {
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(projectOut(row));
+});
+
+/** The project a video belongs to: its own id for a project's first video. */
+async function projectOf(id: string): Promise<string | null> {
+  const row = await get<{ id: string; parent_id: string | null }>("SELECT id, parent_id FROM edit_projects WHERE id = ?", [id]);
+  return row ? (row.parent_id ?? row.id) : null;
+}
+
+/** Every video of the project this one belongs to: the first, then the rest as they were made. */
+app.get("/api/projects/:id/videos", async (c) => {
+  const root = await projectOf(c.req.param("id"));
+  if (!root) return c.json({ error: "Not found" }, 404);
+  const rows = await query<{ id: string; name: string; edl: string; parent_id: string | null; created_at: string; updated_at: string }>(
+    "SELECT id, name, edl, parent_id, created_at, updated_at FROM edit_projects WHERE id = ? OR parent_id = ? ORDER BY parent_id IS NOT NULL, created_at, rowid",
+    [root, root],
+  );
+  return c.json({
+    project: root,
+    videos: rows.map((r) => {
+      const edl = JSON.parse(r.edl) as Edl;
+      const seconds = edl.main.elements.reduce((n, el) => n + (("duration" in el && el.duration) || 0), 0);
+      return {
+        id: r.id,
+        name: r.name,
+        first: r.parent_id === null,
+        shapes: [edl.output, ...(edl.formats ?? [])].map((f) => `${f.width}x${f.height}`),
+        seconds: Math.round(seconds * 10) / 10,
+        updated_at: r.updated_at,
+      };
+    }),
+  });
+});
+
+/** A new video in this project: empty, or a copy of one of its videos (`from`), to cut differently. */
+app.post("/api/projects/:id/videos", async (c) => {
+  const root = await projectOf(c.req.param("id"));
+  if (!root) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ name?: string; from?: string }>().catch(() => ({}) as { name?: string; from?: string });
+  const name = b.name?.trim();
+  if (!name) return c.json({ error: "invalid_request", detail: "name is required" }, 400);
+  let edl: Edl = { ...starterEdl(), output: { width: 1080, height: 1920, fps: 30, background: "#000000" } };
+  if (b.from) {
+    const src = await get<{ edl: string }>("SELECT edl FROM edit_projects WHERE id = ? AND (id = ? OR parent_id = ?)", [b.from, root, root]);
+    if (!src) return c.json({ error: "not_found", detail: "that video is not in this project" }, 404);
+    edl = JSON.parse(src.edl) as Edl;
+  }
+  const id = crypto.randomUUID();
+  await run("INSERT INTO edit_projects (id, name, edl, brief, parent_id) SELECT ?, ?, ?, brief, id FROM edit_projects WHERE id = ?", [
+    id,
+    name.slice(0, 200),
+    JSON.stringify(edl),
+    root,
+  ]);
+  return c.json(projectOut((await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]))!), 201);
+});
+
+app.post("/api/projects", async (c) => {
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; folder?: string; language?: string }>();
+  // A project can start from a Drive folder shared with the link: every video
+  // in it, and in the folders inside it, becomes this project's footage.
+  let folder: { id: string; name: string; videos: FolderVideo[]; truncated: boolean } | null = null;
+  if (b.folder !== undefined) {
+    const link = parseDriveLink(String(b.folder));
+    if (link?.kind !== "folder") return c.json({ error: "invalid_request", detail: "that isn't a Google Drive folder link" }, 400);
+    const walk = await readFolder(link.id);
+    if ("failure" in walk) return c.json({ error: "folder_unreadable", detail: walk.failure }, 422);
+    folder = { id: link.id, ...walk };
+  }
+  const name = b.name?.trim() || folder?.name;
+  if (!name) return c.json({ error: "name is required" }, 400);
+
+  let edl: Edl;
+  if (b.edl !== undefined) {
+    const v = validateEdl(b.edl);
+    if ("invalid" in v) return c.json(v.invalid, 422);
+    edl = v.edl;
+  } else {
+    edl = starterEdl();
+  }
+
+  const id = crypto.randomUUID();
+  await run("INSERT INTO edit_projects (id, name, edl, brief) VALUES (?, ?, ?, ?)", [
+    id,
+    name.slice(0, 200),
+    JSON.stringify(edl),
+    b.brief?.trim() ?? "",
+  ]);
+  let footage: FolderAdded | undefined;
+  if (folder) footage = await addFolder(c, id, folder, b.language);
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  return c.json({ ...projectOut(row!), ...(footage ? { footage } : {}) }, 201);
+});
+
+app.put("/api/projects/:id", async (c) => {
+  const id = c.req.param("id");
+  const existing = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
+  const b = await c.req.json<{ name?: string; edl?: unknown; brief?: string; parent_id?: string }>();
+  // Move a project in as a video of another one: only a project with no
+  // footage and no videos of its own, into a project (never into a video).
+  if (b.parent_id !== undefined && b.parent_id !== (existing as { parent_id?: string | null }).parent_id) {
+    const into = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ? AND parent_id IS NULL AND id != ?", [b.parent_id, id]);
+    const own = await get<{ n: number }>(
+      "SELECT (SELECT COUNT(*) FROM edit_projects WHERE parent_id = ?) + (SELECT COUNT(*) FROM project_footage WHERE project_id = ?) AS n",
+      [id, id],
+    );
+    if (!into) return c.json({ error: "invalid_request", detail: "parent_id must be a project" }, 422);
+    if (own && own.n > 0) return c.json({ error: "conflict", detail: "this project has footage or videos of its own" }, 409);
+    await run("UPDATE edit_projects SET parent_id = ? WHERE id = ?", [into.id, id]);
+  }
+  let edlJson = existing.edl;
+  if (b.edl !== undefined) {
+    const v = validateEdl(b.edl);
+    if ("invalid" in v) return c.json(v.invalid, 422);
+    edlJson = JSON.stringify(v.edl);
+  }
+  await run(
+    "UPDATE edit_projects SET name = ?, edl = ?, brief = ?, updated_at = datetime('now') WHERE id = ?",
+    [b.name?.trim() || existing.name, edlJson, b.brief !== undefined ? b.brief.trim() : existing.brief, id],
+  );
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [id]);
+  return c.json(projectOut(row!));
+});
+
+// Auto-cut: assemble the project's main track from several clips in ONE model
+// pass — the model watches every clip together (ordering and cross-clip
+// redundancy can't be judged one clip at a time) against the project brief.
+// Replaces the main track and adds a captions overlay; other overlay/audio
+// tracks are left untouched.
+/**
+ * Change the cut by asking for it. The model calls a fixed set of checked
+ * operations rather than writing the document, and the whole instruction
+ * lands as one edit, so the editor can undo it in one step.
+ */
+/**
+ * The project's highlights for the AI editor: never a dropped one; kept
+ * first, then the best, in the order the model put them when the project
+ * asked for a number of them (the first that many are marked best).
+ */
+async function instructHighlights(videoId: string): Promise<InstructHighlight[]> {
+  // Footage and its highlights belong to the project, whichever of its videos asks.
+  const projectId = (await projectOf(videoId)) ?? videoId;
+  const project = await get<{ highlights_wanted: number | null }>("SELECT highlights_wanted FROM edit_projects WHERE id = ?", [projectId]);
+  const wanted = project?.highlights_wanted ?? 0;
+  const rows = await query<{ id: string; asset_id: string; kind: HighlightKind; src_in: number; src_out: number; text: string; speaker: string; score: number; pick: string | null }>(
+    `SELECT h.id, f.asset_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.pick
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
+      WHERE h.project_id = ? AND f.status = 'ready' AND f.asset_id IS NOT NULL AND (h.pick IS NULL OR h.pick = 'keep')
+      ORDER BY h.pick IS NULL, COALESCE(h.rank, 1000000000), h.score DESC, f.folder, f.name, h.src_in
+      LIMIT 120`,
+    [projectId],
+  );
+  return rows.map((r, i) => ({
+    best: i < wanted,
+    id: r.id,
+    src: `asset:${r.asset_id}`,
+    kind: r.kind,
+    start: r.src_in,
+    end: r.src_out,
+    text: r.text,
+    speaker: r.speaker,
+    score: r.score,
+    kept: r.pick === "keep",
+  }));
+}
+
+/** How many videos the model is shown it may add. */
+const MAX_LISTED_VIDEOS = 40;
+
+/**
+ * Videos the model may add to the cut: this project's footage first, then the
+ * library, newest first. Reading only: nothing is attached or analysed here.
+ */
+async function instructVideos(projectId: string): Promise<InstructVideo[]> {
+  const rows = await query<{ id: string; name: string; duration: number | null; in_project: number }>(
+    `SELECT a.id, a.name, a.duration,
+            EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = COALESCE((SELECT parent_id FROM edit_projects WHERE id = ?), ?) AND f.asset_id = a.id AND f.status = 'ready') AS in_project
+       FROM assets a
+      WHERE a.content_type LIKE 'video/%' AND a.deleting = 0
+      ORDER BY in_project DESC, a.created_at DESC, a.id
+      LIMIT ?`,
+    [projectId, projectId, MAX_LISTED_VIDEOS],
+  );
+  return rows.map((r, i) => ({ id: `v${i + 1}`, src: `asset:${r.id}`, name: r.name, seconds: r.duration ?? null, inProject: r.in_project === 1 }));
+}
+
+/** Auto-cut, for the conversation: the project's brief comes first, the request's after it. */
+function assembler(env: Bindings, projectBrief: string | null): Assembler | undefined {
+  if (!env.CLAWNIFY_TOKEN) return undefined;
+  return async (clips, brief) => {
+    const cut = await autocutAssets(clips, [projectBrief, brief].filter((x) => x?.trim()).join(" — "), {
+      servicesUrl: env.SERVICES_URL,
+      token: env.CLAWNIFY_TOKEN!,
+      openrouterKey: env.OPENROUTER_API_KEY,
+    });
+    if ("failure" in cut) return { error: cut.failure.detail ?? cut.failure.error };
+    return { edl: (current) => autocutEdl(current, clips.map((x) => x.id), cut.result), notes: cut.result.notes };
+  };
+}
+
+/** Who asked, as the conversation shows it: a person's name, or what kind of caller. */
+function askAuthor(c: Context): string | null {
+  const u = user(c);
+  if (u) return u.name ?? u.email ?? null;
+  const who = caller(c);
+  return who === "agent" || who === "agent-browser" ? "Agent" : null;
+}
+
+/** The project's AI conversation, oldest first (the last 100 messages), and its recent background jobs. */
+app.get("/api/projects/:id/ask", async (c) => {
+  // First, so what follows reads it: a job whose next step was lost is booked
+  // again, and one that stopped is marked so (with its message).
+  await reviveJobs(c.req.param("id"), (job) => bookJob(c.env, new URL(c.req.url).origin, job));
+  const id = c.req.param("id");
+  const rows = await query<{ id: string; role: string; text: string; author: string | null; applied: string | null; asked: number; failed: number; job_id: string | null; made: string | null; created_at: string }>(
+    `SELECT * FROM (SELECT id, role, text, author, applied, asked, failed, job_id, made, created_at, rowid AS r FROM ask_messages
+      WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 100) ORDER BY created_at, r`,
+    [id],
+  );
+  return c.json({
+    messages: rows.map((m) => ({
+      id: m.id,
+      role: m.role,
+      text: m.text,
+      author: m.author,
+      applied: m.applied ? (JSON.parse(m.applied) as string[]) : [],
+      asked: m.asked === 1,
+      failed: m.failed === 1,
+      job_id: m.job_id,
+      made: m.made ? (JSON.parse(m.made) as { id: string; name: string }[]) : [],
+      created_at: m.created_at,
+    })),
+    jobs: (await listJobs(id)).map((j) => jobView(j)),
+  });
+});
+
+/** Start the conversation over: the cut and its undo history are untouched. Running jobs carry on. */
+app.delete("/api/projects/:id/ask", async (c) => {
+  await run("DELETE FROM ask_messages WHERE project_id = ?", [c.req.param("id")]);
+  await dropProposals(c.req.param("id"));
+  return c.json({ ok: true });
+});
+
+/** The last turns the model reads, oldest first; `before` limits them to what came before a job. */
+async function askHistory(projectId: string, before?: string): Promise<InstructTurn[]> {
+  return (
+    await query<{ role: "user" | "assistant"; text: string }>(
+      `SELECT role, text FROM (SELECT role, text, created_at, rowid AS r FROM ask_messages
+        WHERE project_id = ? AND failed = 0 ${before ? "AND created_at < ?" : ""}
+        ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at, r`,
+      before ? [projectId, before, HISTORY_TURNS] : [projectId, HISTORY_TURNS],
+    )
+  ).map((m) => ({ role: m.role, text: m.text }));
+}
+
+/** What a request needs from this app: clip names and lengths, the footage analysis, Auto-cut. */
+async function instructContext(env: Bindings, projectId: string): Promise<InstructContext & { assetNames: Map<string, string> }> {
+  // The model reads clip names, not asset ids; lengths say where a clip ends.
+  const assetNames = new Map<string, string>();
+  const sourceSeconds = new Map<string, number>();
+  for (const row of await query<Asset>("SELECT id, name, duration FROM assets")) {
+    assetNames.set(`asset:${row.id}`, row.name);
+    if (row.duration) sourceSeconds.set(`asset:${row.id}`, row.duration);
+  }
+  const analysisCfg = { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN ?? "", openrouterKey: env.OPENROUTER_API_KEY };
+  const brief = (await get<{ brief: string | null }>("SELECT brief FROM edit_projects WHERE id = ?", [projectId]))?.brief ?? null;
+  return {
+    cfg: { openrouterKey: env.OPENROUTER_API_KEY, servicesUrl: env.SERVICES_URL },
+    assetNames,
+    sourceSeconds,
+    // What the model uses to act on what is in the footage.
+    analyze: async (assetId, window, focus) => {
+      const r = await analyzeAsset(assetId, { mode: "cuts", prompt: focus, window }, analysisCfg);
+      if ("failure" in r) return { error: r.failure.detail };
+      return {
+        keeps: r.result.cuts
+          .filter((cut) => cut.keep)
+          .sort((a, b) => a.start_ms - b.start_ms)
+          .map((cut) => ({ start: cut.start_ms / 1000, end: cut.end_ms / 1000 })),
+        notes: r.result.notes,
+      };
+    },
+    assemble: assembler(env, brief),
+    // Clips become videos of the project this one belongs to.
+    clips: env.CLAWNIFY_TOKEN ? clipDeps(env, (await projectOf(projectId)) ?? projectId) : undefined,
+  };
+}
+
+/** What making clips and framing need from this app: transcripts, the model, projects, framing analysis. */
+function clipDeps(env: Bindings, project: string): ClipDeps {
+  return {
+    async transcript(assetId) {
+      // A transcript already made is used in whatever language it is in.
+      const kept = await get<{ transcript_lang: string | null }>("SELECT transcript_lang FROM assets WHERE id = ? AND transcript IS NOT NULL", [assetId]);
+      const lang = kept?.transcript_lang ?? "en";
+      const t = await assetTranscript(env, assetId, lang);
+      if ("code" in t) return { error: t.code === 404 ? "the video was removed" : "the transcript could not be read; try again" };
+      if (t.status === "unavailable") return { error: "only videos kept on the media service have a transcript; this one is in app storage" };
+      if (t.status === "preparing" || t.status === "transcribing") return { wait: t.status };
+      return { cues: t.status === "ready" ? parseVtt(t.vtt) : [], lang };
+    },
+    ask: (prompt, schema) => modelJson(env.OPENROUTER_API_KEY, prompt, schema),
+    async createProject(id, name, edl, brief) {
+      const checked = validateEdl(edl);
+      if ("invalid" in checked) throw new Error(checked.invalid.detail);
+      await run("INSERT OR IGNORE INTO edit_projects (id, name, edl, brief, parent_id) VALUES (?, ?, ?, ?, ?)", [
+        id,
+        name.slice(0, 100),
+        JSON.stringify(checked.edl),
+        brief.slice(0, 1000),
+        project,
+      ]);
+    },
+    frame: async (assetId, start, end) => (await requestFraming(env, { asset_id: assetId, start, end })).body,
+    check: async (id) => (await readFraming(env, id)).body,
+    async saveFramed(projectId, before, after) {
+      const was = validateEdl(before);
+      const next = validateEdl(after);
+      if ("invalid" in was || "invalid" in next) return false;
+      // Only over the cut as it was made: a person who already edited it keeps their edit.
+      const written = await get<{ id: string }>(
+        "UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ? AND edl = ? RETURNING id",
+        [JSON.stringify(next.edl), projectId, JSON.stringify(was.edl)],
+      );
+      return !!written;
+    },
+    newId: () => crypto.randomUUID(),
+    now: () => Date.now(),
+  };
+}
+
+/** One model call that answers in JSON of `schema`, on the org's own key. */
+async function modelJson(key: string | undefined, prompt: string, schema: object): Promise<{ json: unknown } | { error: string }> {
+  if (!key) return { error: "no OpenRouter key available to this app — add one in the dashboard's API Keys settings" };
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "google/gemini-3.7-flash",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      response_format: { type: "json_schema", json_schema: { name: "answer", strict: true, schema } },
+    }),
+  });
+  if (!res.ok) return { error: `the model call failed (${res.status})` };
+  const body = (await res.json().catch(() => null)) as { choices?: { message?: { content?: string } }[] } | null;
+  try {
+    return { json: JSON.parse(body?.choices?.[0]?.message?.content ?? "") };
+  } catch {
+    return { error: "the model's answer could not be read" };
+  }
+}
+
+/** What a background job needs from this app, and how it books its next delivery. */
+function jobDeps(c: Context<{ Bindings: Bindings }>, book?: JobDeps["book"]): JobDeps {
+  return {
+    context: (projectId) => instructContext(c.env, projectId),
+    highlights: instructHighlights,
+    videos: instructVideos,
+    history: askHistory,
+    book: book ?? ((job) => bookJob(c.env, new URL(c.req.url).origin, job)),
+  };
+}
+
+/** Queue a job; with no queue to take it (local development), run its steps after the response. */
+async function startJob(c: Context<{ Bindings: Bindings }>, job: AskJobRow): Promise<boolean> {
+  if (await bookJob(c.env, new URL(c.req.url).origin, job)) return true;
+  if (c.env.CLAWNIFY_TOKEN) return false;
+  const local: JobDeps = jobDeps(c, async (next) => {
+    c.executionCtx.waitUntil(runJobStep(next.id, local).then(() => {}));
+    return true;
+  });
+  c.executionCtx.waitUntil(runJobStep(job.id, local).then(() => {}));
+  return true;
+}
+
+app.post("/api/projects/:id/instruct", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  const b = await c.req
+    .json<{ instruction?: string; background?: boolean }>()
+    .catch(() => ({}) as { instruction?: string; background?: boolean });
+  const instruction = b.instruction?.trim();
+  if (!instruction) return c.json({ error: "invalid_request", detail: "instruction is required" }, 422);
+
+  const current = validateEdl(JSON.parse(project.edl));
+  if ("invalid" in current) return c.json(current.invalid, 422);
+
+  const author = askAuthor(c);
+  // A new request replaces a proposal nobody answered.
+  await dropProposals(project.id);
+  const userSays = (failed: boolean) =>
+    run("INSERT INTO ask_messages (project_id, role, text, author, failed) VALUES (?, 'user', ?, ?, ?)", [
+      project.id,
+      instruction,
+      author,
+      failed ? 1 : 0,
+    ]);
+
+  // A caller that already knows it wants the background (an agent) skips the proposal.
+  if (b.background === true) {
+    await userSays(false);
+    const job = await createJob(project.id, instruction, author, "queued", null);
+    if (!(await startJob(c, job))) {
+      await run("UPDATE ask_jobs SET status = 'failed', error = ? WHERE id = ?", ["the queue could not take it", job.id]);
+      return c.json({ error: "queue_unavailable", detail: "The background queue could not take this request. Try again in a minute." }, 503);
+    }
+    const said = "Running this in the background. It applies as one step you can undo when it is done.";
+    await run("INSERT INTO ask_messages (project_id, role, text, job_id) VALUES (?, 'assistant', ?, ?)", [project.id, said, job.id]);
+    return c.json({ edl: current.edl, said, applied: [], asked: false, job: jobView(job) }, 202);
+  }
+
+  const ctx = await instructContext(c.env, project.id);
+  const out = await instructEdit(
+    current.edl,
+    instruction,
+    ctx.assetNames,
+    ctx.cfg,
+    ctx.sourceSeconds,
+    ctx.analyze,
+    await instructHighlights(project.id),
+    await askHistory(project.id),
+    { videos: await instructVideos(project.id), assemble: ctx.assemble, clips: ctx.clips, watchBudget: QUICK_WATCH_SECONDS },
+  );
+  // A failed exchange stays on screen but out of what the model reads next.
+  await userSays("failure" in out);
+  if ("failure" in out) {
+    await run("INSERT INTO ask_messages (project_id, role, text, failed) VALUES (?, 'assistant', ?, 1)", [
+      project.id,
+      out.failure.detail,
+    ]);
+    return c.json(out.failure, 422);
+  }
+  // Too much to watch for a quick answer: say what it would take, change nothing.
+  if ("background" in out) {
+    const job = await createJob(project.id, instruction, author, "proposed", out.background);
+    const said = proposalText(out.background);
+    await run("INSERT INTO ask_messages (project_id, role, text, asked, job_id) VALUES (?, 'assistant', ?, 1, ?)", [project.id, said, job.id]);
+    return c.json({ edl: current.edl, said, applied: [], asked: true, job: jobView(job) });
+  }
+  // A question back, or nothing changed: only the conversation records it.
+  if (out.asked || out.applied.length === 0 || unchanged(project.edl, JSON.stringify(out.edl))) {
+    await run("INSERT INTO ask_messages (project_id, role, text, applied, asked) VALUES (?, 'assistant', ?, ?, ?)", [
+      project.id,
+      out.said,
+      JSON.stringify(out.asked ? [] : out.applied),
+      out.asked ? 1 : 0,
+    ]);
+    return c.json({ edl: current.edl, said: out.said, applied: [], asked: out.asked === true });
+  }
+  // Written only over the cut it read, and kept with the cut before it, so it
+  // can be put back later from anywhere.
+  const job = await recordQuick(project.id, instruction, author, project.edl, out);
+  const stale = job.status === "stale";
+  const said = stale ? `${out.said} The cut changed while this ran, so it was kept aside instead of applied.` : out.said;
+  await run("INSERT INTO ask_messages (project_id, role, text, applied, asked, job_id) VALUES (?, 'assistant', ?, ?, 0, ?)", [
+    project.id,
+    said,
+    JSON.stringify(out.applied),
+    job.id,
+  ]);
+  return c.json(
+    stale
+      ? { edl: current.edl, said, applied: [], asked: false, job: jobView(job) }
+      : { edl: out.edl, said, applied: out.applied, asked: false, job: jobView(job) },
+  );
+});
+
+/** Put an AI change back: the cut before it returns, while the cut is still what the change made. */
+app.post("/api/projects/:id/ask/jobs/:job/revert", async (c) => {
+  const out = await revertJob(c.req.param("id"), c.req.param("job"));
+  if ("refused" in out) {
+    const detail =
+      out.refused === "changed"
+        ? "The cut has changed since this was applied, so putting it back would undo those changes too. Undo it in the editor instead."
+        : "There is no applied change to put back.";
+    return c.json({ error: out.refused, detail }, out.refused === "not_found" ? 404 : 409);
+  }
+  return c.json(jobView(out.job, true));
+});
+
+/** One background job, with the cut it started from and its result. */
+app.get("/api/projects/:id/ask/jobs/:job", async (c) => {
+  const job = await get<AskJobRow>("SELECT * FROM ask_jobs WHERE id = ? AND project_id = ?", [c.req.param("job"), c.req.param("id")]);
+  if (!job) return c.json({ error: "not_found" }, 404);
+  return c.json(jobView(job, true));
+});
+
+/** Yes to a proposal: queue it. */
+app.post("/api/projects/:id/ask/jobs/:job/run", async (c) => {
+  const job = await get<AskJobRow>(
+    "UPDATE ask_jobs SET status = 'queued', updated_at = datetime('now') WHERE id = ? AND project_id = ? AND status = 'proposed' RETURNING *",
+    [c.req.param("job"), c.req.param("id")],
+  );
+  if (!job) return c.json({ error: "not_proposed", detail: "This request is no longer waiting for a yes. Ask again." }, 409);
+  if (!(await startJob(c, job))) {
+    await run("UPDATE ask_jobs SET status = 'proposed', updated_at = datetime('now') WHERE id = ?", [job.id]);
+    return c.json({ error: "queue_unavailable", detail: "The background queue could not take this request. Try again in a minute." }, 503);
+  }
+  return c.json(jobView(job), 202);
+});
+
+/** Stop a job: a proposal is dropped, a running one finishes but is not applied, a kept result is let go. */
+app.post("/api/projects/:id/ask/jobs/:job/cancel", async (c) => {
+  const job = await get<AskJobRow>(
+    `UPDATE ask_jobs SET status = 'cancelled', updated_at = datetime('now')
+      WHERE id = ? AND project_id = ? AND status IN ('proposed', 'queued', 'running', 'stale') RETURNING *`,
+    [c.req.param("job"), c.req.param("id")],
+  );
+  if (!job) return c.json({ error: "not_running", detail: "This request has already finished." }, 409);
+  return c.json(jobView(job));
+});
+
+/** Apply a result that was kept aside because the cut changed while it ran. */
+app.post("/api/projects/:id/ask/jobs/:job/apply", async (c) => {
+  const out = await applyKept(c.req.param("id"), c.req.param("job"));
+  if ("refused" in out) return c.json({ error: out.refused, detail: "There is no kept result to apply." }, out.refused === "not_found" ? 404 : 409);
+  return c.json(jobView(out.job, true));
+});
+
+// The platform queue's call to run a background AI request. Public, because
+// the queue calls from outside the app's sign-in; the signature is the check.
+app.post("/api/ask/step", async (c) => {
+  const body = await c.req.text();
+  const signed = await verifyDelivery(body, {
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  }).catch(() => false);
+  if (!signed) return c.json({ error: "unauthorized" }, 401);
+  let jobId = "";
+  try {
+    jobId = String((JSON.parse(body) as { job_id?: unknown }).job_id ?? "");
+  } catch {
+    /* answered below */
+  }
+  // Always a 2xx: a job that is gone, finished, or held by another delivery
+  // has nothing for this one to do, and a step that runs books the next.
+  const out = await runJobStep(jobId, jobDeps(c));
+  return c.json({ ok: true, status: out.status });
+});
+
+app.post("/api/projects/:id/autocut", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [c.req.param("id")]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json({ error: "Auto-cut runs on deployed apps (missing CLAWNIFY_TOKEN)." }, 503);
+  }
+
+  const b = await c.req
+    .json<{ asset_ids?: string[]; prompt?: string }>()
+    .catch(() => ({}) as { asset_ids?: string[]; prompt?: string });
+  const ids = Array.isArray(b.asset_ids) ? b.asset_ids : [];
+  if (ids.length === 0) return c.json({ error: "autocut_failed", detail: "asset_ids is required" }, 422);
+
+  const clips: { id: string; name: string }[] = [];
+  for (const id of ids) {
+    const a = await get<Asset>("SELECT * FROM assets WHERE id = ?", [id]);
+    if (!a) return c.json({ error: "autocut_failed", detail: `no asset with id "${id}"` }, 422);
+    if (!a.content_type.startsWith("video/")) {
+      return c.json({ error: "autocut_failed", detail: `"${a.name}" is not a video` }, 422);
+    }
+    clips.push({ id: a.id, name: a.name });
+  }
+
+  const brief = [project.brief, b.prompt].filter((s) => s?.trim()).join(" — ");
+  const cut = await autocutAssets(clips, brief, {
+    servicesUrl: c.env.SERVICES_URL,
+    token: c.env.CLAWNIFY_TOKEN,
+    openrouterKey: c.env.OPENROUTER_API_KEY,
+  });
+  if ("failure" in cut) return c.json(cut.failure, 422);
+
+  const edl = autocutEdl(JSON.parse(project.edl) as Edl, clips.map((x) => x.id), cut.result);
+
+  const v = validateEdl(edl);
+  if ("invalid" in v) return c.json(v.invalid, 422);
+  await run("UPDATE edit_projects SET edl = ?, updated_at = datetime('now') WHERE id = ?", [
+    JSON.stringify(v.edl),
+    project.id,
+  ]);
+  const row = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [project.id]);
+  return c.json({ ...projectOut(row!), notes: cut.result.notes });
+});
+
+app.delete("/api/projects/:id", async (c) => {
+  await backfillHighlights();
+  const id = c.req.param("id");
+  // A project's other videos go first, so its footage is no longer theirs.
+  for (const v of await query<{ id: string }>("SELECT id FROM edit_projects WHERE parent_id = ?", [id])) await deleteVideoRows(v.id);
+  // Its footage from Drive goes first. Each clip is a copy on the media
+  // service, counted against the org's storage until it is deleted there, so
+  // a big shoot is deleted a batch per call: 202 says how many are left, and
+  // calling again carries on. A clip another project uses stays, in the library.
+  const footage = await query<{
+    id: string;
+    asset_id: string | null;
+    source_kind: string;
+    media_uid: string | null;
+    copy_id: string | null;
+    upload_uid: string | null;
+  }>(
+    `SELECT f.id, f.source_kind, f.asset_id, a.media_uid, f.copy_id, f.upload_uid FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE f.project_id = ? LIMIT ?`,
+    [id, FOOTAGE_DELETE_BATCH],
+  );
+  // A copy made in the connected account's Drive for an import still under
+  // way goes too: it is the size of the original.
+  // One that can't be deleted keeps its clip for the next call. Without the
+  // connection there is no way to reach it, and the project goes regardless.
+  const copies = footage.filter((f) => f.source_kind === "drive" && f.copy_id);
+  const copyLeft = new Set<string>();
+  if (copies.length) {
+    const drive = await driveSource(c.env);
+    if (drive) {
+      await Promise.all(
+        copies.map(async (f) => {
+          if (!(await removeCopy(drive, f.copy_id!))) copyLeft.add(f.id);
+        }),
+      );
+    }
+  }
+  if (footage.length > 0) {
+    await Promise.all(
+      footage.map(async (f) => {
+        if (f.source_kind === "library") {
+          await run("DELETE FROM project_footage WHERE id = ?", [f.id]);
+          return; // A reference never owns the library video or its media copy.
+        }
+        if (copyLeft.has(f.id)) return;
+        // A file coming in a piece at a time has an upload open, holding
+        // storage until it is deleted.
+        if (f.upload_uid) {
+          try {
+            await deleteMedia(mediaCfg(c.env), f.upload_uid);
+          } catch {
+            return; // kept for the next call
+          }
+        }
+        if (f.asset_id) {
+          const claim = await run(`UPDATE assets SET deleting = 1 WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = assets.id AND h.deleted_at IS NULL)
+            AND NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = assets.id AND f.project_id != ? AND f.status != 'removed')
+            AND NOT EXISTS (SELECT 1 FROM edit_projects WHERE id != ? AND edl LIKE ?)`,
+            [f.asset_id, id, id, `%"asset:${f.asset_id}"%`]);
+          if (claim.changes) {
+            try {
+              if (f.media_uid) await deleteMedia(mediaCfg(c.env), f.media_uid);
+            } catch {
+              return; // unreachable: kept for the next call
+            }
+            await run("DELETE FROM assets WHERE id = ?", [f.asset_id]);
+          }
+        }
+        await run("DELETE FROM project_footage WHERE id = ?", [f.id]);
+      }),
+    );
+    const left = await get<{ n: number }>("SELECT COUNT(*) AS n FROM project_footage WHERE project_id = ?", [id]);
+    if (left && left.n > 0) return c.json({ ok: false, remaining: left.n }, 202);
+  }
+  await run("DELETE FROM footage_sources WHERE project_id = ?", [id]);
+  await run("DELETE FROM footage_highlights WHERE project_id = ?", [id]);
+  await deleteVideoRows(id);
+  return c.json({ ok: true });
+});
+
+/** One video and what is its own: exports and their files, share link, comments, conversation. */
+async function deleteVideoRows(id: string): Promise<void> {
+  // Drop each completed export's rendered file from storage before the rows go,
+  // otherwise the renders/*.mp4 objects outlive the only rows that point to them
+  // and are orphaned forever. Best-effort: a storage hiccup must not strand the
+  // project (an unreachable object is a smaller problem than an undeletable one).
+  const jobs = await query<{ output_url: string | null }>(
+    "SELECT output_url FROM export_jobs WHERE project_id = ? AND output_url IS NOT NULL",
+    [id],
+  );
+  const keys = jobs.map((j) => renderKey(j.output_url)).filter((k): k is string => k !== null);
+  if (keys.length) await deleteUpload(keys).catch(() => {});
+  await run("DELETE FROM share_links WHERE project_id = ?", [id]);
+  await run("DELETE FROM review_comments WHERE project_id = ?", [id]);
+  await run("DELETE FROM ask_messages WHERE project_id = ?", [id]);
+  await run("DELETE FROM ask_jobs WHERE project_id = ?", [id]);
+  await run("DELETE FROM export_jobs WHERE project_id = ?", [id]);
+  await run("DELETE FROM edit_projects WHERE id = ?", [id]);
+}
+
+// ── Footage from Drive folders ──────────────────────────────────────
+// A project's own clips, from folders shared with the link: imported and
+// logged in the background, a few at a time. See src/server/footage.ts.
+
+const FOOTAGE_DELETE_BATCH = 100;
+const LANGUAGE = /^[a-z]{2}$/;
+
+interface FolderAdded {
+  folder: { id: string; name: string };
+  /** Videos in the folder and the folders inside it. */
+  found: number;
+  /** Of those, the ones new to the project. */
+  added: number;
+  /** A walk limit was reached, and some videos were left out. */
+  truncated: boolean;
+}
+
+async function addFolder(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  folder: { id: string; name: string; videos: FolderVideo[]; truncated: boolean },
+  language?: string,
+): Promise<FolderAdded> {
+  const lang = language && LANGUAGE.test(language) ? language : "en";
+  const added = await addFolderVideos(projectId, folder, folder.videos, lang);
+  if (added > 0) await keepFootageMoving(c, projectId, "read");
+  return { folder: { id: folder.id, name: folder.name }, found: folder.videos.length, added, truncated: folder.truncated };
+}
+
+/** The org's Google Drive connection as a footage source, when it has one. */
+async function driveSource(env: Bindings): Promise<DriveSource | undefined> {
+  if (!env.CREDENTIALS) return undefined;
+  const status = await driveStatus(env).catch(() => null);
+  if (!status?.connected || !status.service) return undefined;
+  const service = status.service;
+  const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+  return {
+    piece: (fileId, start, end, signal) => driveFilePiece(env, service, fileId, start, end, signal),
+    size: (fileId) => driveFileSize(env, service, fileId),
+    async download(fileId) {
+      try {
+        const file = await driveFileLink(env, fileId);
+        // Footage always has its shared link: a bigger file comes by that,
+        // a piece at a time when Drive won't hand it over whole.
+        if ("tooBig" in file) return { error: "over what one answer through the connection carries (250 MB)" };
+        return { url: file.url, mimeType: file.mimeType };
+      } catch (e) {
+        return { error: message(e) };
+      }
+    },
+    remove: (fileId) => driveRemove(env, fileId),
+  };
+}
+
+/** Clips wait to be read, or the picks to be put in order: model work for a delivery. */
+async function highlightsWork(projectId: string): Promise<boolean> {
+  return (await highlightsPending(projectId)) > 0 || (await rankingDue(projectId));
+}
+
+/** Book the next background step while there is work a step can do. */
+async function keepFootageMoving(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  after: "delivery" | "read",
+  at: string | null = null,
+): Promise<string | null> {
+  const row = await get<{ footage_step_at: string | null }>("SELECT footage_step_at FROM edit_projects WHERE id = ?", [projectId]);
+  return bookStep(c.env, new URL(c.req.url).origin, projectId, { after, bookedAt: row?.footage_step_at ?? null, at });
+}
+
+async function advanceFootage(
+  c: Context<{ Bindings: Bindings }>,
+  projectId: string,
+  after: "delivery" | "read",
+): Promise<{ outcome: StepOutcome; nextStepAt: string | null }> {
+  // With the org's Drive connection, clips come in through it, on deliveries
+  // only: a download through it takes from seconds to minutes.
+  const drive = await driveSource(c.env);
+  const outcome = await stepFootage(mediaCfg(c.env), projectId, {
+    drive: after === "delivery" ? drive : undefined,
+    startImports: !(drive && after === "read"),
+    // Pieces of a file Drive won't hand over whole take a while: deliveries only.
+    relay: after === "delivery",
+  });
+  // Highlights are read only on a delivery: a model call takes up to half a
+  // minute, and a read answers at once. A read still keeps the chain booked.
+  const highlightsMoving =
+    after === "delivery"
+      ? (await stepHighlights(mediaCfg(c.env), c.env.OPENROUTER_API_KEY, projectId)).moving
+      : !!c.env.OPENROUTER_API_KEY && (await highlightsWork(projectId));
+  const nextStepAt =
+    outcome.moving || highlightsMoving
+      ? await keepFootageMoving(c, projectId, after)
+      : outcome.nextAt
+        ? await keepFootageMoving(c, projectId, after, outcome.nextAt)
+        : null;
+  return { outcome, nextStepAt };
+}
+
+interface FootageItemRow {
+  id: string;
+  source_kind: "drive" | "library";
+  name: string;
+  folder: string;
+  status: string;
+  error: string | null;
+  log_status: string | null;
+  log_error: string | null;
+  log: string | null;
+  retry_at: string | null;
+  asset_id: string | null;
+  key: string | null;
+  content_type: string | null;
+  size: number | null;
+  duration: number | null;
+  media_uid: string | null;
+  upload_size: number | null;
+  upload_done: number | null;
+}
+
+function footageOut(r: FootageItemRow) {
+  return {
+    id: r.id,
+    name: r.name,
+    folder: r.folder,
+    source_kind: r.source_kind,
+    status: r.status,
+    error: r.error,
+    // Set while the clip waits on Google Drive: when it is tried again.
+    retry_at: r.retry_at,
+    // Set while a file Drive won't hand over whole comes in a piece at a time.
+    received: r.upload_size ? { bytes: r.upload_done ?? 0, size: r.upload_size } : null,
+    asset: r.asset_id
+      ? {
+          id: r.asset_id,
+          key: r.key,
+          name: r.name,
+          content_type: r.content_type,
+          size: r.size,
+          duration: r.duration,
+          media_uid: r.media_uid,
+        }
+      : null,
+    log_status: r.log_status,
+    log_error: r.log_error,
+    log: r.log ? JSON.parse(r.log) : null,
+  };
+}
+
+const FOOTAGE_COLUMNS = `f.id, f.source_kind, f.name, f.folder, f.status, f.error, f.retry_at, f.log_status, f.log_error, f.asset_id,
+       a.key, a.content_type, a.size, a.duration, a.media_uid, f.upload_size, f.upload_done`;
+
+function intParam(v: string | undefined, fallback: number, min: number, max: number): number {
+  const n = Number.parseInt(v ?? "", 10);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+// The project's footage and each clip's log, moving the work on by a step
+// first (step=0 skips that, for a quick first look). Pages: with logs (the
+// default) 50 a page, at most 200; with logs=0 only each log's summary, kind
+// and quality, and up to 3000 a page. Narrow with folder= (a folder and
+// everything inside it), kind=, status=.
+app.get("/api/projects/:id/footage", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const { outcome, nextStepAt } =
+    c.req.query("step") === "0" ? { outcome: null, nextStepAt: null } : await advanceFootage(c, id, "read");
+
+  const full = c.req.query("logs") !== "0";
+  const limit = intParam(c.req.query("limit"), full ? 50 : 3000, 1, full ? 200 : 3000);
+  const offset = intParam(c.req.query("offset"), 0, 0, 1_000_000);
+  const where = ["f.project_id = ?", "f.status != 'removed'"];
+  const params: unknown[] = [id];
+  const folder = c.req.query("folder")?.replace(/\/+$/, "");
+  if (folder) {
+    where.push("(f.folder = ? OR substr(f.folder, 1, ?) = ?)");
+    params.push(folder, folder.length + 1, `${folder}/`);
+  }
+  const kind = c.req.query("kind");
+  if (kind) {
+    where.push("json_extract(f.log, '$.kind') = ?");
+    params.push(kind);
+  }
+  const status = c.req.query("status");
+  if (status) {
+    where.push("f.status = ?");
+    params.push(status);
+  }
+  const rows = await query<FootageItemRow>(
+    `SELECT ${FOOTAGE_COLUMNS},
+            CASE WHEN f.log IS NULL THEN NULL
+                 WHEN ? THEN f.log
+                 ELSE json_object('summary', json_extract(f.log, '$.summary'),
+                                  'kind', json_extract(f.log, '$.kind'),
+                                  'quality', json_extract(f.log, '$.quality')) END AS log
+       FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY f.folder, f.name, f.id
+      LIMIT ? OFFSET ?`,
+    [full ? 1 : 0, ...params, limit, offset],
+  );
+  const tally = await query<{ status: string; log_status: string | null; on_drive: number; n: number }>(
+    `SELECT status, log_status, retry_at IS NOT NULL AS on_drive, COUNT(*) AS n FROM project_footage
+      WHERE project_id = ? AND status != 'removed' GROUP BY status, log_status, on_drive`,
+    [id],
+  );
+  const count = (pick: (t: { status: string; log_status: string | null; on_drive: number }) => boolean) =>
+    tally.filter(pick).reduce((sum, t) => sum + t.n, 0);
+  const sources = await query<{ folder_id: string; name: string; language: string }>(
+    "SELECT folder_id, name, language FROM footage_sources WHERE project_id = ? ORDER BY created_at",
+    [id],
+  );
+  return c.json({
+    sources: sources.map((s) => ({
+      id: s.folder_id,
+      name: s.name,
+      language: s.language,
+      url: `https://drive.google.com/drive/folders/${s.folder_id}`,
+    })),
+    counts: {
+      total: count(() => true),
+      waiting: count((t) => t.status === "waiting"),
+      // Of those, the ones waiting until Google Drive hands them over.
+      drive_waiting: count((t) => t.status === "waiting" && t.on_drive === 1),
+      importing: count((t) => t.status === "importing"),
+      ready: count((t) => t.status === "ready"),
+      failed: count((t) => t.status === "failed"),
+      logged: count((t) => t.log_status === "done"),
+      logging: count((t) => t.log_status === "preparing" || t.log_status === "running"),
+      log_failed: count((t) => t.log_status === "failed"),
+    },
+    // Why nothing more is starting, when the org has hit a limit.
+    imports_paused: outcome?.importsBlocked ?? null,
+    logging_paused: outcome?.logsBlocked ?? null,
+    next_step_at: nextStepAt,
+    items: rows.map(footageOut),
+    next_offset: rows.length === limit ? offset + limit : null,
+  });
+});
+
+app.get("/api/projects/:id/footage/:clip", async (c) => {
+  const row = await get<FootageItemRow>(
+    `SELECT ${FOOTAGE_COLUMNS}, f.log FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE f.project_id = ? AND f.id = ?`,
+    [c.req.param("id"), c.req.param("clip")],
+  );
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(footageOut(row));
+});
+
+// Existing library videos are references, not copies owned by a project.
+// A bounded, searchable picker; never return playback URLs or project-owned clips.
+app.get("/api/projects/:id/library-videos", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const search = (c.req.query("search") ?? "").trim().slice(0, 200);
+  const offset = intParam(c.req.query("offset"), 0, 0, 1_000_000);
+  const rows = await query<Asset & { attached: number }>(
+    `SELECT a.id, a.name, a.duration, a.size, a.media_uid, a.deleting,
+            EXISTS (SELECT 1 FROM project_footage f WHERE f.project_id = ? AND f.asset_id = a.id AND f.source_kind = 'library' AND f.status != 'removed') AS attached
+       FROM assets a WHERE a.content_type LIKE 'video/%'
+        AND (? = '' OR instr(lower(a.name), lower(?)) > 0)
+        AND (NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')
+      OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL))
+      ORDER BY a.created_at DESC, a.id LIMIT 51 OFFSET ?`, [id, search, search, offset]);
+  return c.json({ items: rows.slice(0, 50).map((a) => ({ id: a.id, name: a.name, duration: a.duration, attached: !!a.attached,
+    supported: !!a.media_uid && !a.deleting, unavailable_reason: a.deleting ? "This video is being removed from the library." : !a.media_uid ? "This older upload supports timeline editing only." : null })), next_offset: rows.length > 50 ? offset + 50 : null });
+});
+
+app.post("/api/projects/:id/footage/assets", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ asset_id?: unknown; language?: unknown }>().catch(() => ({} as { asset_id?: unknown; language?: unknown }));
+  if (!b || Array.isArray(b) || typeof b.asset_id !== "string" || b.asset_id.length > 100 || (b.language !== undefined && (typeof b.language !== "string" || !LANGUAGE.test(b.language))))
+    return c.json({ error: "invalid_request", detail: "Choose a library video and a two-letter speech language." }, 400);
+  const asset = await get<Asset>(`SELECT a.* FROM assets a WHERE a.id = ? AND a.deleting = 0
+    AND (NOT EXISTS (SELECT 1 FROM project_footage f WHERE f.asset_id = a.id AND f.source_kind = 'drive')
+      OR EXISTS (SELECT 1 FROM library_highlights h WHERE h.asset_id = a.id AND h.deleted_at IS NULL))`, [b.asset_id]);
+  if (!asset) return c.json({ error: "not_found", detail: "This video is not in the shared library." }, 404);
+  if (!asset.content_type.startsWith("video/") || !asset.media_uid)
+    return c.json({ error: "unsupported_video", detail: "Highlights needs a video uploaded through the editor or imported from Drive. This older storage-only file can still be edited on the timeline." }, 422);
+  const existing = await get<{ id: string }>("SELECT id FROM project_footage WHERE project_id = ? AND source_kind = 'library' AND asset_id = ? AND status != 'removed'", [id, asset.id]);
+  if (existing) {
+    await keepFootageMoving(c, id, "read");
+    return c.json({ id: existing.id, added: false });
+  }
+  const state = await mediaState(mediaCfg(c.env), asset.media_uid);
+  if ("failure" in state) return c.json({ error: state.failure.error, detail: state.failure.detail }, 502);
+  if (!state.media.ready) return c.json({ error: "not_ready", detail: state.media.error || "This video is still being prepared. Try again when it can play." }, 409);
+  const language = typeof b.language === "string" ? b.language : "en";
+  // Logs describe the source, while highlights and people's choices belong
+  // to this project. Reuse a completed library log in the same language.
+  const logged = await get<{ log: string }>(`SELECT log FROM project_footage WHERE source_kind = 'library' AND asset_id = ?
+    AND language = ? AND log_status = 'done' AND log IS NOT NULL ORDER BY updated_at DESC LIMIT 1`, [asset.id, language]);
+  const result = await run(`INSERT OR IGNORE INTO project_footage
+    (project_id, drive_file_id, source_kind, name, language, status, asset_id, log_status, log)
+    SELECT ?, ?, 'library', name, ?, 'ready', id, ?, ? FROM assets
+      WHERE id = ? AND deleting = 0 AND EXISTS (SELECT 1 FROM edit_projects WHERE id = ?)`,
+    [id, `asset:${asset.id}`, language, logged ? "done" : null, logged?.log ?? null, asset.id, id]);
+  await run("UPDATE assets SET duration = COALESCE(duration, ?) WHERE id = ?", [state.media.duration, asset.id]);
+  const row = await get<{ id: string; status: string }>("SELECT id, status FROM project_footage WHERE project_id = ? AND source_kind = 'library' AND asset_id = ?", [id, asset.id]);
+  if (!row || row.status !== "ready") return c.json({ error: "not_found", detail: "The project or video was removed. Refresh and try again." }, 404);
+  await keepFootageMoving(c, id, "read");
+  return c.json({ id: row.id, added: result.changes > 0 }, result.changes ? 201 : 200);
+});
+
+// Removing a reference never removes media or changes a timeline. Stop work
+// first so an in-flight analysis cannot make this reference ready again.
+app.delete("/api/projects/:id/footage/assets/:asset", async (c) => {
+  await backfillHighlights();
+  const id = c.req.param("id"), asset = c.req.param("asset");
+  const row = await get<{ id: string }>("SELECT id FROM project_footage WHERE project_id = ? AND source_kind = 'library' AND asset_id = ?", [id, asset]);
+  if (row) {
+    await run("UPDATE project_footage SET status = 'removed' WHERE id = ?", [row.id]);
+    await run("DELETE FROM footage_highlights WHERE footage_id = ? AND project_id = ?", [row.id, id]);
+    await run("DELETE FROM project_footage WHERE id = ?", [row.id]);
+    await run("UPDATE edit_projects SET highlights_rank_status = 'waiting', highlights_rank_at = NULL WHERE id = ? AND highlights_wanted IS NOT NULL", [id]);
+  }
+  return c.json({ ok: true });
+});
+
+// Add a folder shared with the link: its videos and those in every folder
+// inside it. Adding one again adds only what is new.
+app.post("/api/projects/:id/footage/folders", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ url?: string; language?: string }>().catch(() => ({}) as { url?: string; language?: string });
+  const link = parseDriveLink(b.url ?? "");
+  if (link?.kind !== "folder") return c.json({ error: "invalid_request", detail: "that isn't a Google Drive folder link" }, 400);
+  const walk = await readFolder(link.id);
+  if ("failure" in walk) return c.json({ error: "folder_unreadable", detail: walk.failure }, 422);
+  return c.json(await addFolder(c, id, { id: link.id, ...walk }, b.language), 201);
+});
+
+// Look in the project's folders again and take in what has been added since.
+app.post("/api/projects/:id/footage/sync", async (c) => {
+  const id = c.req.param("id");
+  const sources = await query<{ folder_id: string; language: string }>(
+    "SELECT folder_id, language FROM footage_sources WHERE project_id = ?",
+    [id],
+  );
+  if (sources.length === 0) return c.json({ error: "not_found", detail: "this project has no Drive folder" }, 404);
+  const folders: (FolderAdded | { folder: { id: string }; error: string })[] = [];
+  for (const s of sources) {
+    const walk = await readFolder(s.folder_id);
+    folders.push(
+      "failure" in walk
+        ? { folder: { id: s.folder_id }, error: walk.failure }
+        : await addFolder(c, id, { id: s.folder_id, ...walk }, s.language),
+    );
+  }
+  return c.json({ added: folders.reduce((n, f) => n + ("added" in f ? f.added : 0), 0), folders });
+});
+
+// Put every clip that failed to import or to be logged back in line.
+app.post("/api/projects/:id/footage/retry", async (c) => {
+  const id = c.req.param("id");
+  const imports = await run(
+    `UPDATE project_footage SET status = 'waiting', error = NULL, retry_at = NULL, drive_tries = 0,
+            transcode = CASE WHEN error LIKE '%bitrate exceeded%' THEN 1 ELSE transcode END, updated_at = datetime('now')
+      WHERE project_id = ? AND source_kind = 'drive' AND (status = 'failed' OR (status = 'waiting' AND retry_at IS NOT NULL))`,
+    [id],
+  );
+  const logs = await run(
+    `UPDATE project_footage SET log_status = NULL, log_error = NULL, log_job = NULL, updated_at = datetime('now')
+      WHERE project_id = ? AND log_status = 'failed'`,
+    [id],
+  );
+  if (imports.changes + logs.changes > 0) await keepFootageMoving(c, id, "read");
+  return c.json({ imports: imports.changes, logs: logs.changes });
+});
+
+// ── Highlights ───────────────────────────────────────────────────────
+// The selects: for every logged clip, whether it is worth an editor's time
+// and the parts to cut from, each with a score and the reason. Found in the
+// background from the logs and transcripts (src/server/highlights.ts); a
+// person keeps or drops each one; the kept ones export to an editor's own
+// software (src/server/nle.ts).
+
+interface HighlightListRow {
+  id: string;
+  footage_id: string;
+  kind: HighlightKind;
+  src_in: number;
+  src_out: number;
+  text: string;
+  speaker: string;
+  score: number;
+  reason: string;
+  pick: "keep" | "drop" | null;
+  origin: string;
+  name: string;
+  folder: string;
+  drive_file_id: string;
+  asset_id: string | null;
+  media_uid: string | null;
+  duration: number | null;
+  fps: number | null;
+  width: number | null;
+  height: number | null;
+}
+
+function highlightOut(r: HighlightListRow) {
+  return {
+    id: r.id,
+    clip: { id: r.footage_id, name: r.name, folder: r.folder, asset_id: r.asset_id, media_uid: r.media_uid, duration: r.duration },
+    kind: r.kind,
+    start: r.src_in,
+    end: r.src_out,
+    text: r.text,
+    speaker: r.speaker,
+    score: r.score,
+    reason: r.reason,
+    pick: r.pick,
+    origin: r.origin,
+  };
+}
+
+const PICKS = ["open", "keep", "drop", "not_dropped", "all", "best"] as const;
+type PickFilter = (typeof PICKS)[number];
+
+/**
+ * The project's best `wanted` picks: the kept ones first, then the first in
+ * the order the model put them in (src/server/highlights.ts), then by score
+ * for any it hasn't placed yet. Dropping one brings in the next.
+ */
+const BEST_PICKS = `SELECT b.id FROM footage_highlights b JOIN project_footage bf ON bf.id = b.footage_id
+   WHERE b.project_id = ? AND bf.status != 'removed' AND (b.pick IS NULL OR b.pick = 'keep')
+   ORDER BY b.pick IS NULL, COALESCE(b.rank, 1000000000), b.score DESC, bf.folder, bf.name, b.src_in, b.id
+   LIMIT ?`;
+
+/** The WHERE for a project's highlights, narrowed by the list's and export's shared filters. */
+function highlightFilter(projectId: string, q: (k: string) => string | undefined, defaultPick: PickFilter, wanted: number | null) {
+  const where = ["h.project_id = ?", "f.status != 'removed'"];
+  const params: unknown[] = [projectId];
+  const kind = q("kind");
+  if (kind === "soundbite" || kind === "broll") {
+    where.push("h.kind = ?");
+    params.push(kind);
+  }
+  const min = Number.parseInt(q("min_score") ?? "", 10);
+  if (min >= 2 && min <= 5) {
+    where.push("h.score >= ?");
+    params.push(min);
+  }
+  let pick = (PICKS as readonly string[]).includes(q("pick") ?? "") ? (q("pick") as PickFilter) : defaultPick;
+  // Without a number asked for, there is no best set: everything not dropped.
+  if (pick === "best" && !wanted) pick = "not_dropped";
+  if (pick === "open") where.push("h.pick IS NULL");
+  else if (pick === "keep") where.push("h.pick = 'keep'");
+  else if (pick === "drop") where.push("h.pick = 'drop'");
+  else if (pick === "not_dropped") where.push("(h.pick IS NULL OR h.pick = 'keep')");
+  else if (pick === "best") {
+    where.push(`h.id IN (${BEST_PICKS})`);
+    params.push(projectId, wanted);
+  }
+  const folder = q("folder")?.replace(/\/+$/, "");
+  if (folder) {
+    where.push("(f.folder = ? OR substr(f.folder, 1, ?) = ?)");
+    params.push(folder, folder.length + 1, `${folder}/`);
+  }
+  return { where: where.join(" AND "), params, pick };
+}
+
+const HIGHLIGHT_COLUMNS = `h.id, h.footage_id, h.kind, h.src_in, h.src_out, h.text, h.speaker, h.score, h.reason, h.pick, h.origin,
+       f.name, f.folder, f.source_kind, f.drive_file_id, f.asset_id, f.fps, f.width, f.height, a.media_uid, a.duration`;
+
+/** `wanted` as a request gives it: a whole number of highlights, null for no number, undefined when left out. */
+function wantedOf(v: unknown): number | null | undefined | "invalid" {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  return Number.isInteger(v) && (v as number) >= 1 && (v as number) <= MAX_WANTED ? (v as number) : "invalid";
+}
+const WANTED_INVALID = `wanted is a whole number of highlights from 1 to ${MAX_WANTED}, or null for every pick worth a look`;
+
+// Ask for highlights, or ask again. Without `again`, only clips not yet read
+// (and ones that failed) are read; with it, every logged clip is read again,
+// and what a person kept or dropped stays as it is. `brief`, when given,
+// becomes the project's brief: what the video is for. `wanted`, when given,
+// is how many highlights the video wants (null: no number).
+app.post("/api/projects/:id/highlights", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req
+    .json<{ brief?: unknown; again?: unknown; wanted?: unknown }>()
+    .catch(() => ({}) as { brief?: unknown; again?: unknown; wanted?: unknown });
+  const brief = typeof b.brief === "string" ? b.brief.trim().slice(0, 2000) : null;
+  const wanted = wantedOf(b.wanted);
+  if (wanted === "invalid") return c.json({ error: "invalid_request", detail: WANTED_INVALID }, 400);
+  if (wanted !== undefined) await setWanted(id, wanted);
+  await run(
+    "UPDATE edit_projects SET highlights_at = COALESCE(highlights_at, datetime('now')), highlights_stopped_at = NULL, brief = COALESCE(?, brief) WHERE id = ?",
+    [brief, id],
+  );
+  // (Picks this reading finds put the best in order again, as they land.)
+  await run(
+    `UPDATE project_footage SET highlights_status = 'waiting', highlights_error = NULL
+      WHERE project_id = ? AND status = 'ready' AND log_status = 'done'
+        AND (highlights_status IS NULL OR highlights_status = 'failed' OR (? AND highlights_status = 'done'))`,
+    [id, b.again === true ? 1 : 0],
+  );
+  const pending = await highlightsPending(id);
+  const nextStepAt = c.env.OPENROUTER_API_KEY && (await highlightsWork(id)) ? await keepFootageMoving(c, id, "read") : null;
+  return c.json({ ok: true, pending, next_step_at: nextStepAt, paused: c.env.OPENROUTER_API_KEY ? null : HIGHLIGHTS_NO_KEY }, 202);
+});
+
+/** Set how many highlights a project wants; with a number, its picks wait to be put in order. */
+async function setWanted(projectId: string, wanted: number | null): Promise<void> {
+  // A person's number is put in order at once: no wait for footage still coming.
+  await run(
+    `UPDATE edit_projects SET highlights_wanted = ?, highlights_rank_error = NULL, highlights_rank_at = NULL,
+        highlights_rank_status = CASE WHEN ? IS NULL THEN NULL ELSE 'waiting' END
+      WHERE id = ?`,
+    [wanted, wanted, projectId],
+  );
+  // No number, no order: the AI editor goes back to kept first, then score.
+  if (wanted === null) await run("UPDATE footage_highlights SET rank = NULL WHERE project_id = ? AND rank IS NOT NULL", [projectId]);
+}
+
+// How many highlights the video wants, changed on its own: the picks found so
+// far are put in order again (one model call, in the background), and nothing
+// is read again. null: no number, every pick worth a look.
+app.put("/api/projects/:id/highlights/wanted", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  const b = await c.req.json<{ wanted?: unknown }>().catch(() => ({}) as { wanted?: unknown });
+  const wanted = wantedOf(b.wanted);
+  if (wanted === "invalid" || wanted === undefined) return c.json({ error: "invalid_request", detail: WANTED_INVALID }, 400);
+  await setWanted(id, wanted);
+  const due = await rankingDue(id);
+  const nextStepAt = c.env.OPENROUTER_API_KEY && due ? await keepFootageMoving(c, id, "read") : null;
+  return c.json({ ok: true, wanted, next_step_at: nextStepAt, paused: due && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null });
+});
+
+// Stop reading. Clips in line go back to how they were (read before: their
+// picks stay; never read: not asked), and clips logged later don't join until
+// highlights are asked for again. A batch already with the model still lands.
+app.post("/api/projects/:id/highlights/stop", async (c) => {
+  const id = c.req.param("id");
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [id]))) return c.json({ error: "Not found" }, 404);
+  await run("UPDATE edit_projects SET highlights_stopped_at = datetime('now') WHERE id = ? AND highlights_at IS NOT NULL", [id]);
+  await run(
+    `UPDATE project_footage SET highlights_status = CASE
+        WHEN skip_reason IS NOT NULL OR EXISTS (SELECT 1 FROM footage_highlights h WHERE h.footage_id = project_footage.id) THEN 'done'
+        ELSE NULL END
+      WHERE project_id = ? AND highlights_status IN ('waiting', 'running')`,
+    [id],
+  );
+  return c.json({ ok: true, pending: await highlightsPending(id) });
+});
+
+// The highlights, best first by default. Filters: kind=soundbite|broll,
+// min_score=2..5, pick=best|open|keep|drop|not_dropped|all (default all),
+// folder= (a folder and everything inside it), sort=score|clip. Pages of 100,
+// at most 1000. skipped=1 adds the clips judged not worth using, and why.
+// pick=best is the project's best `wanted`: which they are is the model's
+// call; they are listed best scored first like the rest (the model's order
+// breaks ties; it lists a set as it read it, not by strength).
+app.get("/api/projects/:id/highlights", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{
+    brief: string;
+    highlights_at: string | null;
+    highlights_stopped_at: string | null;
+    highlights_wanted: number | null;
+    highlights_rank_status: string | null;
+    highlights_rank_error: string | null;
+  }>(
+    "SELECT brief, highlights_at, highlights_stopped_at, highlights_wanted, highlights_rank_status, highlights_rank_error FROM edit_projects WHERE id = ?",
+    [id],
+  );
+  if (!project) return c.json({ error: "Not found" }, 404);
+  const q = (k: string) => c.req.query(k);
+  const { where, params, pick } = highlightFilter(id, q, "all", project.highlights_wanted);
+  const limit = intParam(q("limit"), 100, 1, 1000);
+  const offset = intParam(q("offset"), 0, 0, 1_000_000);
+  const order =
+    q("sort") === "clip"
+      ? "f.folder, f.name, h.src_in"
+      : pick === "best"
+        ? "h.score DESC, COALESCE(h.rank, 1000000000), f.folder, f.name, h.src_in"
+        : "h.score DESC, f.folder, f.name, h.src_in";
+  const rows = await query<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where}
+      ORDER BY ${order}, h.id
+      LIMIT ? OFFSET ?`,
+    [...params, limit, offset],
+  );
+  const clips = await query<{ highlights_status: string | null; skipped: number; n: number }>(
+    `SELECT highlights_status, skip_reason IS NOT NULL AS skipped, COUNT(*) AS n FROM project_footage
+      WHERE project_id = ? AND status = 'ready' AND log_status = 'done' GROUP BY highlights_status, skipped`,
+    [id],
+  );
+  const picks = await query<{ kind: string; pick: string | null; n: number }>(
+    `SELECT h.kind, h.pick, COUNT(*) AS n FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id
+      WHERE h.project_id = ? AND f.status != 'removed' GROUP BY h.kind, h.pick`,
+    [id],
+  );
+  const preparation = await get<{ total: number; preparing: number; logging: number; failed: number }>(
+    `SELECT COUNT(*) AS total,
+      COALESCE(SUM(status IN ('waiting', 'importing') OR (status = 'ready' AND (log_status IS NULL OR log_status IN ('preparing', 'running')))), 0) AS preparing,
+      COALESCE(SUM(status = 'ready' AND (log_status IS NULL OR log_status IN ('preparing', 'running'))), 0) AS logging,
+      COALESCE(SUM(status = 'failed' OR log_status = 'failed'), 0) AS failed
+     FROM project_footage WHERE project_id = ? AND status != 'removed'`, [id]);
+  const clipCount = (pick: (r: { highlights_status: string | null; skipped: number }) => boolean) =>
+    clips.filter(pick).reduce((sum, r) => sum + r.n, 0);
+  const pickCount = (pick: (r: { kind: string; pick: string | null }) => boolean) =>
+    picks.filter(pick).reduce((sum, r) => sum + r.n, 0);
+  const pending = clipCount((r) => r.highlights_status === "waiting" || r.highlights_status === "running");
+  const rankDue = await rankingDue(id);
+  const nextStepAt = (preparation?.logging ?? 0) > 0 || ((pending > 0 || rankDue) && c.env.OPENROUTER_API_KEY)
+    ? await keepFootageMoving(c, id, "read") : null;
+  const wanted = project.highlights_wanted;
+  const skipped =
+    q("skipped") === "1"
+      ? await query<{ id: string; name: string; folder: string; skip_reason: string; asset_id: string | null; media_uid: string | null; duration: number | null }>(
+          `SELECT f.id, f.name, f.folder, f.skip_reason, f.asset_id, a.media_uid, a.duration
+             FROM project_footage f LEFT JOIN assets a ON a.id = f.asset_id
+            WHERE f.project_id = ? AND f.status = 'ready' AND f.skip_reason IS NOT NULL
+            ORDER BY f.folder, f.name`,
+          [id],
+        )
+      : undefined;
+  return c.json({
+    asked: !!project.highlights_at,
+    stopped: !!project.highlights_stopped_at,
+    brief: project.brief,
+    clips: {
+      total: preparation?.total ?? 0,
+      preparing: preparation?.preparing ?? 0,
+      preparation_failed: preparation?.failed ?? 0,
+      logged: clipCount(() => true),
+      done: clipCount((r) => r.highlights_status === "done"),
+      pending,
+      failed: clipCount((r) => r.highlights_status === "failed"),
+      skipped: clipCount((r) => r.highlights_status === "done" && r.skipped === 1),
+      not_asked: clipCount((r) => r.highlights_status === null),
+    },
+    counts: {
+      total: pickCount(() => true),
+      soundbites: pickCount((r) => r.kind === "soundbite"),
+      broll: pickCount((r) => r.kind === "broll"),
+      kept: pickCount((r) => r.pick === "keep"),
+      dropped: pickCount((r) => r.pick === "drop"),
+      open: pickCount((r) => r.pick === null),
+      best: wanted ? Math.min(wanted, pickCount((r) => r.pick !== "drop")) : 0,
+    },
+    // How many the video wants (null: every pick worth a look), and where
+    // putting them in order stands: `due`, it runs on the next step; waiting
+    // and not due, footage is still coming in and it runs again shortly.
+    wanted,
+    ranking: wanted
+      ? { status: project.highlights_rank_status, error: project.highlights_rank_error, due: rankDue }
+      : null,
+    paused: project.highlights_at && (pending > 0 || rankDue) && !c.env.OPENROUTER_API_KEY ? HIGHLIGHTS_NO_KEY : null,
+    next_step_at: nextStepAt,
+    highlights: rows.map(highlightOut),
+    next_offset: rows.length === limit ? offset + limit : null,
+    ...(skipped ? { skipped: skipped.map((s) => ({ id: s.id, name: s.name, folder: s.folder, reason: s.skip_reason, asset_id: s.asset_id, media_uid: s.media_uid, duration: s.duration })) } : {}),
+  });
+});
+
+// A person's call on one highlight: pick keep | drop | null (back to
+// unreviewed), its in and out (seconds into the clip) if they move them, and
+// who says it or what it shows when they know better (a name and title).
+app.patch("/api/projects/:id/highlights/:hid", async (c) => {
+  const row = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.project_id = ? AND h.id = ?`,
+    [c.req.param("id"), c.req.param("hid")],
+  );
+  if (!row) return c.json({ error: "Not found" }, 404);
+  const b = await c.req
+    .json<{ pick?: unknown; start?: unknown; end?: unknown; speaker?: unknown; text?: unknown }>()
+    .catch(() => ({}) as { pick?: unknown; start?: unknown; end?: unknown; speaker?: unknown; text?: unknown });
+  if (b.speaker !== undefined && typeof b.speaker !== "string") return c.json({ error: "invalid_request", detail: "speaker is text" }, 400);
+  if (b.text !== undefined && (typeof b.text !== "string" || !b.text.trim())) return c.json({ error: "invalid_request", detail: "text can't be empty" }, 400);
+  let pick = row.pick;
+  if (b.pick !== undefined) {
+    if (b.pick !== null && b.pick !== "keep" && b.pick !== "drop") return c.json({ error: "invalid_request", detail: "pick is keep, drop or null" }, 400);
+    pick = b.pick;
+  }
+  const length = row.duration ?? Infinity;
+  const start = b.start === undefined ? row.src_in : Number(b.start);
+  const end = b.end === undefined ? row.src_out : Number(b.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > length + 0.05 || end - start < 0.2) {
+    return c.json({ error: "invalid_request", detail: "start and end must lie inside the clip, end after start" }, 400);
+  }
+  await run("UPDATE footage_highlights SET pick = ?, src_in = ?, src_out = ?, speaker = ?, text = ?, updated_at = datetime('now') WHERE id = ?", [
+    pick,
+    Math.round(start * 100) / 100,
+    Math.round(Math.min(end, length) * 100) / 100,
+    typeof b.speaker === "string" ? b.speaker.trim().slice(0, 120) : row.speaker,
+    typeof b.text === "string" ? b.text.trim().slice(0, 1000) : row.text,
+    row.id,
+  ]);
+  const updated = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.id = ?`,
+    [row.id],
+  );
+  return c.json(highlightOut(updated!));
+});
+
+// A person's own pick, for a part the model passed over or a clip it skipped.
+// It starts out kept.
+app.post("/api/projects/:id/highlights/items", async (c) => {
+  const id = c.req.param("id");
+  const b = await c.req
+    .json<{ clip?: unknown; start?: unknown; end?: unknown; kind?: unknown; text?: unknown }>()
+    .catch(() => ({}) as Record<string, unknown>);
+  const clip = await get<{ id: string; duration: number | null }>(
+    `SELECT f.id, a.duration FROM project_footage f JOIN assets a ON a.id = f.asset_id WHERE f.project_id = ? AND f.id = ? AND f.status = 'ready'`,
+    [id, String(b.clip ?? "")],
+  );
+  if (!clip) return c.json({ error: "Not found", detail: "no such clip in this project" }, 404);
+  const length = clip.duration ?? Infinity;
+  const start = b.start === undefined ? 0 : Number(b.start);
+  const end = b.end === undefined ? length : Number(b.end);
+  const kind = b.kind === "soundbite" ? "soundbite" : "broll";
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end > length + 0.05 || end - start < 0.2) {
+    return c.json({ error: "invalid_request", detail: "start and end must lie inside the clip, end after start" }, 400);
+  }
+  const hid = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  await run(
+    `INSERT INTO footage_highlights (id, project_id, footage_id, kind, src_in, src_out, text, score, reason, pick, origin)
+     SELECT ?, ?, ?, ?, ?, ?, ?, 3, '', 'keep', 'person'
+       WHERE EXISTS (SELECT 1 FROM project_footage WHERE id = ? AND project_id = ? AND status = 'ready')`,
+    [hid, id, clip.id, kind, Math.round(start * 100) / 100, Math.round(Math.min(end, length) * 100) / 100, typeof b.text === "string" ? b.text.trim().slice(0, 1000) : "", clip.id, id],
+  );
+  const row = await get<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE h.id = ?`,
+    [hid],
+  );
+  if (!row) return c.json({ error: "not_found", detail: "The video was removed from this project." }, 404);
+  return c.json(highlightOut(row), 201);
+});
+
+// The highlights as a file for an editor's own software. format=csv (a sheet)
+// or xml (a Premiere Pro / DaVinci Resolve timeline). Same filters as the
+// list (pick=best: the project's best `wanted`); by default everything not
+// dropped.
+app.get("/api/projects/:id/highlights/export", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ name: string; highlights_wanted: number | null }>("SELECT name, highlights_wanted FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Not found" }, 404);
+  const q = (k: string) => c.req.query(k);
+  const { where, params } = highlightFilter(id, q, "not_dropped", project.highlights_wanted);
+  const rows = await query<HighlightListRow>(
+    `SELECT ${HIGHLIGHT_COLUMNS}
+       FROM footage_highlights h JOIN project_footage f ON f.id = h.footage_id LEFT JOIN assets a ON a.id = f.asset_id
+      WHERE ${where}
+      ORDER BY f.folder, f.name, h.src_in, h.id
+      LIMIT 5000`,
+    params,
+  );
+  const base = `${project.name.replace(/[^\w .-]+/g, "").trim() || "highlights"} highlights`;
+  const format = q("format") === "xml" ? "xml" : "csv";
+  if (format === "csv") {
+    return new Response(highlightsCsv(rows), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${base}.csv"`,
+      },
+    });
+  }
+  // A timeline: the picks on the camera files, for Premiere Pro or Resolve.
+  // root= is where the editor downloaded the footage folder, so the files are
+  // found without relinking; fps= sets the timeline's rate.
+  const fps = Number(q("fps"));
+  const xml = highlightsXml(
+    `${project.name.trim() || "Highlights"} highlights`,
+    rows.map((r) => ({
+      kind: r.kind,
+      src_in: r.src_in,
+      src_out: r.src_out,
+      text: r.text,
+      speaker: r.speaker,
+      score: r.score,
+      reason: r.reason,
+      file: { id: r.footage_id, name: r.name, folder: r.folder, duration: r.duration ?? r.src_out, fps: r.fps, width: r.width, height: r.height },
+    })),
+    { root: (q("root") ?? "").slice(0, 1000), rate: fps >= 10 && fps <= 120 ? rateOf(fps) : undefined },
+  );
+  return new Response(xml, {
+    headers: {
+      "Content-Type": "application/xml; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${base}.xml"`,
+    },
+  });
+});
+
+// The platform queue's call for the next background step. Public, because the
+// queue calls from outside the app's sign-in; the signature is the check.
+app.post("/api/footage/step", async (c) => {
+  const body = await c.req.text();
+  const signed = await verifyDelivery(body, {
+    signature: c.req.header("X-Queue-Signature") ?? null,
+    timestamp: c.req.header("X-Queue-Timestamp") ?? null,
+    keyId: c.req.header("X-Queue-Key-Id") ?? null,
+  }).catch(() => false);
+  if (!signed) return c.json({ error: "unauthorized" }, 401);
+  let projectId = "";
+  try {
+    projectId = String((JSON.parse(body) as { project_id?: unknown }).project_id ?? "");
+  } catch {
+    /* no project: answered below */
+  }
+  // A project deleted since the step was booked: nothing to do, and a 2xx so
+  // the queue does not try again.
+  if (!(await get("SELECT 1 AS found FROM edit_projects WHERE id = ?", [projectId]))) return c.json({ ok: true });
+  const { outcome, nextStepAt } = await advanceFootage(c, projectId, "delivery");
+  return c.json({ ok: true, pending: outcome.pending, next_step_at: nextStepAt });
+});
+
+// ── Exports ──────────────────────────────────────────────────────────
+
+app.get("/api/exports", async (c) => {
+  const projectId = c.req.query("project_id");
+  const rows: ExportJob[] = projectId
+    ? await query<ExportJob>(
+        "SELECT * FROM export_jobs WHERE project_id = ? ORDER BY created_at DESC LIMIT 50",
+        [projectId],
+      )
+    : await query<ExportJob>("SELECT * FROM export_jobs ORDER BY created_at DESC LIMIT 50");
+  return c.json(await Promise.all(rows.map((r) => settleExport(r, exportConfig(c.env)))));
+});
+
+app.get("/api/exports/:id", async (c) => {
+  const row = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [c.req.param("id")]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json(await settleExport(row, exportConfig(c.env)));
+});
+
+function exportConfig(env: Bindings): ExportConfig | null {
+  return env.CLAWNIFY_TOKEN ? { servicesUrl: env.SERVICES_URL, token: env.CLAWNIFY_TOKEN } : null;
+}
+
+/**
+ * Bring an 'exporting' row up to date. The render runs in the background on
+ * the edit service, and nothing calls back when it ends, so whichever read
+ * comes next (the editor polling, an agent, a reload) settles it: a finished
+ * render is copied into this app's storage, a failed one records why. Every
+ * write is guarded on status = 'exporting', so concurrent reads settle a row
+ * once; a duplicate copy lands on the same key (renderKeyFor).
+ */
+async function settleExport(job: ExportJob, cfg: ExportConfig | null): Promise<ExportJob> {
+  if (job.status !== "exporting") return job;
+  const failed = async (msg: string) => {
+    await run(
+      "UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ? AND status = 'exporting'",
+      [msg.slice(0, 1000), job.id],
+    );
+  };
+
+  if (!job.service_job_id) {
+    // Still staging inside its request, or that request was cut off.
+    if (!isAbandonedExport(job.created_at, Date.now())) return job;
+    await failed("export_failed: the export stopped before it finished — export again");
+  } else {
+    if (!cfg) return job;
+    const poll = await pollEdit(job.service_job_id, cfg);
+    if (poll.status === "running") return job;
+    if (poll.status === "failed") {
+      await failed(`edit_failed: ${poll.detail}`);
+    } else {
+      const key = renderKeyFor(job.id, job.service_job_id);
+      try {
+        await copyOutput(poll.result, key);
+        await run(
+          "UPDATE export_jobs SET status = 'completed', output_url = ?, duration = ?, size = ?, updated_at = datetime('now') WHERE id = ? AND status = 'exporting'",
+          [`/api/uploads/${encodeURIComponent(key)}`, poll.result.duration, poll.result.size, job.id],
+        );
+      } catch (err) {
+        await failed(`export_failed: ${String(err).slice(0, 500)}`);
+      }
+    }
+  }
+  return (await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [job.id])) ?? job;
+}
+
+app.post("/api/projects/:id/export", async (c) => {
+  const project = await get<EditProject>("SELECT * FROM edit_projects WHERE id = ?", [
+    c.req.param("id"),
+  ]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  if (!c.env.CLAWNIFY_TOKEN) {
+    return c.json(
+      { error: "Edit service not configured (missing CLAWNIFY_TOKEN). Exports run on deployed apps." },
+      503,
+    );
+  }
+
+  const parsed = validateEdl(JSON.parse(project.edl));
+  if ("invalid" in parsed) return c.json(parsed.invalid, 422);
+  if (parsed.edl.main.elements.length === 0) {
+    return c.json(
+      { error: "edl_invalid", detail: "the main track is empty — add clips before exporting", path: "/main/elements" },
+      422,
+    );
+  }
+
+  const b = (await c.req.json<{ quality?: string; format?: string | null }>().catch(() => ({}))) as {
+    quality?: string;
+    format?: string | null;
+  };
+  const quality = ["draft", "standard", "high"].includes(b.quality ?? "") ? b.quality! : "standard";
+  const format = b.format ?? null;
+  if (format !== null && !findFormat(parsed.edl, format)) {
+    return c.json(
+      { error: "format_unknown", detail: `${format} is not one of this project's formats`, path: "/formats" },
+      422,
+    );
+  }
+  const cfg = { servicesUrl: c.env.SERVICES_URL, token: c.env.CLAWNIFY_TOKEN };
+
+  const res = await run("INSERT INTO export_jobs (project_id, status, format) VALUES (?, 'exporting', ?)", [
+    project.id,
+    format,
+  ]);
+  const jobId = res.lastInsertRowid as number;
+
+  // Hand the render to the edit service. This runs to the end even if the
+  // caller goes away mid-request (a phone locking, a laptop closing): cut off
+  // between the insert and the render's start, an export used to be left
+  // with no render at all, failing only when a read noticed, 15 minutes on.
+  const handover: Promise<{ ok: true } | ExportFailure> = (async () => {
+    try {
+      const resolved = await resolveEdlSources(renderDoc(parsed.edl, format), cfg);
+      if ("failure" in resolved) return resolved.failure;
+      const name = format ? `${project.name} ${format.replace(":", "x")}` : project.name;
+      const started = await startEdit(resolved.edl, { quality, filename: `${makeKey(name)}.mp4` }, cfg);
+      if ("failure" in started) return started.failure;
+      // The render is on its way; reads of this job settle it (settleExport).
+      await run("UPDATE export_jobs SET service_job_id = ?, updated_at = datetime('now') WHERE id = ?", [
+        started.jobId,
+        jobId,
+      ]);
+      return { ok: true as const };
+    } catch (err) {
+      return { error: "export_failed", detail: String(err).slice(0, 500) };
+    }
+  })().then(async (outcome) => {
+    if ("error" in outcome) {
+      const msg = `${outcome.error}: ${outcome.detail}${outcome.path ? ` (at ${outcome.path})` : ""}`.slice(0, 1000);
+      await run("UPDATE export_jobs SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?", [msg, jobId]);
+    }
+    return outcome;
+  });
+  c.executionCtx.waitUntil(handover.then(() => {}));
+  const outcome = await handover;
+
+  const job = await get<ExportJob>("SELECT * FROM export_jobs WHERE id = ?", [jobId]);
+  if ("error" in outcome) {
+    // Machine-readable failure alongside the job row, so an editing loop can
+    // jump straight to the offending EDL node.
+    const { error, detail, path } = outcome;
+    return c.json({ ...job, failure: { error, detail, ...(path ? { path } : {}) } }, 201);
+  }
+  return c.json(job, 201);
+});
+
+// ── Share by link ────────────────────────────────────────────────────
+// One link per project, pinned to one finished export. Exporting again does
+// not change what viewers see (drafts are exports too); moving the pin to the
+// newest export is a deliberate step. Turning the link off deletes the token,
+// and turning it on again gives a new address.
+
+interface ShareLink {
+  token: string;
+  project_id: string;
+  export_id: number;
+  /** 1: viewers can comment. */
+  comments: number;
+  created_at: string;
+}
+
+/** The project's newest finished export, which a link is pinned to on create or update. */
+async function latestExport(projectId: string) {
+  return get<Pick<ExportJob, "id" | "output_url" | "updated_at">>(
+    "SELECT id, output_url, updated_at FROM export_jobs WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
+    [projectId],
+  );
+}
+
+async function shareOut(c: { req: { url: string } }, projectId: string) {
+  const link = await get<ShareLink & { exported_at: string }>(
+    `SELECT s.*, e.updated_at AS exported_at FROM share_links s JOIN export_jobs e ON e.id = s.export_id
+      WHERE s.project_id = ?`,
+    [projectId],
+  );
+  const latest = await latestExport(projectId);
+  if (!link) return { url: null, can_share: Boolean(latest) };
+  return {
+    url: new URL(`/s/${link.token}`, c.req.url).toString(),
+    export_id: link.export_id,
+    exported_at: link.exported_at,
+    // A finished export newer than the one viewers see.
+    newer_export: latest && latest.id !== link.export_id ? latest.id : null,
+    comments: link.comments === 1,
+    created_at: link.created_at,
+  };
+}
+
+app.get("/api/projects/:id/share", async (c) => c.json(await shareOut(c, c.req.param("id"))));
+
+// Turns the link on, or moves it to the newest export. The token is kept, so
+// the address already sent out keeps working.
+app.put("/api/projects/:id/share", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ id: string }>("SELECT id FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  const latest = await latestExport(id);
+  if (!latest) {
+    return c.json({ error: "nothing_exported", detail: "export the project first; a link plays a finished export" }, 409);
+  }
+  await run(
+    `INSERT INTO share_links (token, project_id, export_id) VALUES (?, ?, ?)
+       ON CONFLICT(project_id) DO UPDATE SET export_id = excluded.export_id`,
+    [makeShareToken(), id, latest.id],
+  );
+  return c.json(await shareOut(c, id));
+});
+
+// Lets viewers comment, or stops new comments (the ones left stay).
+app.patch("/api/projects/:id/share", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.comments !== "boolean") return c.json({ error: "comments: true or false" }, 400);
+  const res = await run("UPDATE share_links SET comments = ? WHERE project_id = ?", [body.comments ? 1 : 0, id]);
+  if (!res.changes) return c.json({ error: "no_link", detail: "create a link first" }, 404);
+  return c.json(await shareOut(c, id));
+});
+
+app.delete("/api/projects/:id/share", async (c) => {
+  await run("DELETE FROM share_links WHERE project_id = ?", [c.req.param("id")]);
+  return c.json({ url: null, can_share: true });
+});
+
+// ── Review comments (comments.ts) ────────────────────────────────────
+
+interface ReviewComment {
+  id: string;
+  project_id: string;
+  export_id: number;
+  at: number | null;
+  body: string;
+  author: string;
+  resolved_at: string | null;
+  created_at: string;
+}
+
+// Every comment on the project, newest first, with when each one's export
+// read the cut (`cut_at`, the export's request: the EDL is read then, and a
+// render can take minutes): a comment's time is in that export, and the cut
+// may have changed since. `shared_export_id` is the export the link plays now.
+app.get("/api/projects/:id/comments", async (c) => {
+  const id = c.req.param("id");
+  const project = await get<{ updated_at: string }>("SELECT updated_at FROM edit_projects WHERE id = ?", [id]);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+  const comments = await query<ReviewComment & { cut_at: string | null }>(
+    `SELECT r.*, e.created_at AS cut_at FROM review_comments r
+       LEFT JOIN export_jobs e ON e.id = r.export_id
+      WHERE r.project_id = ? ORDER BY r.created_at DESC, r.id LIMIT ?`,
+    [id, MAX_PROJECT_COMMENTS],
+  );
+  const link = await get<{ export_id: number }>("SELECT export_id FROM share_links WHERE project_id = ?", [id]);
+  return c.json({ comments, shared_export_id: link?.export_id ?? null, project_updated_at: project.updated_at });
+});
+
+app.patch("/api/projects/:id/comments/:cid", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (typeof body?.resolved !== "boolean") return c.json({ error: "resolved: true or false" }, 400);
+  const res = await run(
+    `UPDATE review_comments SET resolved_at = ${body.resolved ? "COALESCE(resolved_at, datetime('now'))" : "NULL"}
+      WHERE id = ? AND project_id = ?`,
+    [c.req.param("cid"), c.req.param("id")],
+  );
+  if (!res.changes) return c.json({ error: "Comment not found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.delete("/api/projects/:id/comments/:cid", async (c) => {
+  await run("DELETE FROM review_comments WHERE id = ? AND project_id = ?", [c.req.param("cid"), c.req.param("id")]);
+  return c.json({ ok: true });
+});
+
+// The public half: the only routes reachable without signing in (clawnify.json
+// `api.public_routes`). A token that matches no row is indistinguishable from
+// one that never existed.
+
+/** The link's project and the export it is pinned to, if the link is live. */
+async function sharedExport(token: string) {
+  return get<{ name: string; project_id: string; export_id: number; output_url: string | null; duration: number | null; comments: number }>(
+    `SELECT p.name, s.project_id, s.export_id, e.output_url, e.duration, s.comments
+       FROM share_links s
+       JOIN edit_projects p ON p.id = s.project_id
+       JOIN export_jobs e ON e.id = s.export_id AND e.status = 'completed'
+      WHERE s.token = ?`,
+    [token],
+  );
+}
+
+const PUBLIC_HEADERS = { "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" };
+
+app.get("/s/:token", async (c) => {
+  c.header("Cache-Control", "no-store");
+  for (const [k, v] of Object.entries(PUBLIC_HEADERS)) c.header(k, v);
+  const shared = await sharedExport(c.req.param("token"));
+  if (!shared) {
+    return c.html(notePage("This link doesn't work", "It may have been turned off. Ask whoever sent it for a new one."), 404);
+  }
+  const base = `/s/${encodeURIComponent(c.req.param("token"))}`;
+  const review = shared.comments
+    ? { comments: await linkComments(shared.project_id, shared.export_id), post: `${base}/comments`, v: shared.export_id }
+    : undefined;
+  return c.html(sharePage(shared.name, `${base}/video?v=${shared.export_id}`, review));
+});
+
+/** The comments viewers of a link see: those on the export it plays. */
+async function linkComments(projectId: string, exportId: number): Promise<PublicComment[]> {
+  const rows = await query<ReviewComment>(
+    "SELECT * FROM review_comments WHERE project_id = ? AND export_id = ? ORDER BY created_at, id LIMIT ?",
+    [projectId, exportId, MAX_PROJECT_COMMENTS],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    at: r.at,
+    body: r.body,
+    author: r.author,
+    resolved: r.resolved_at !== null,
+    created_at: r.created_at,
+  }));
+}
+
+// A viewer's comment. Answers with the link's comments, so the page shows
+// what others left meanwhile too.
+app.post("/s/:token/comments", async (c) => {
+  for (const [k, v] of Object.entries(PUBLIC_HEADERS)) c.header(k, v);
+  c.header("Cache-Control", "no-store");
+  const shared = await sharedExport(c.req.param("token"));
+  if (!shared) return c.json({ error: "not_found", detail: "This link doesn't work any more." }, 404);
+  if (!shared.comments) return c.json({ error: "comments_off", detail: "Comments are turned off for this video." }, 403);
+  if (Number(c.req.header("Content-Length") ?? 0) > 8192) {
+    return c.json({ error: "too_large", detail: "That comment is too long." }, 413);
+  }
+  const text = await c.req.text();
+  if (text.length > 8192) return c.json({ error: "too_large", detail: "That comment is too long." }, 413);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    raw = null;
+  }
+  const parsed = parseComment(raw, shared.duration);
+  if (!parsed.ok) return c.json({ error: "invalid", detail: parsed.detail }, 400);
+  const { v, at, body, author } = parsed.value;
+  if (v !== shared.export_id) {
+    return c.json({ error: "moved", detail: "This link now plays a newer version. Reload the page to comment on it." }, 409);
+  }
+  const counts = await get<{ total: number; recent: number }>(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(created_at >= datetime('now', '-1 minute')), 0) AS recent
+       FROM review_comments WHERE project_id = ?`,
+    [shared.project_id],
+  );
+  if ((counts?.recent ?? 0) >= COMMENTS_PER_MINUTE) {
+    return c.json({ error: "busy", detail: "Too many comments at once. Wait a minute and send it again." }, 429);
+  }
+  if ((counts?.total ?? 0) >= MAX_PROJECT_COMMENTS) {
+    return c.json({ error: "full", detail: "This video has as many comments as it can take." }, 429);
+  }
+  await run("INSERT INTO review_comments (project_id, export_id, at, body, author) VALUES (?, ?, ?, ?, ?)", [
+    shared.project_id,
+    v,
+    at,
+    body,
+    author,
+  ]);
+  return c.json({ comments: await linkComments(shared.project_id, v) }, 201);
+});
+
+// `v` names the export the page was rendered with. Only the pinned one is
+// served: a stale `v` (the pin moved meanwhile) gets a 404 rather than another
+// file's bytes mid-playback, and other cuts are never reachable by guessing ids.
+app.get("/s/:token/video", async (c) => {
+  const shared = await sharedExport(c.req.param("token"));
+  const key = renderKey(shared?.output_url);
+  const v = c.req.query("v");
+  if (!shared || !key || (v !== undefined && v !== String(shared.export_id))) {
+    return c.text("Not found", 404, PUBLIC_HEADERS);
+  }
+  const download = c.req.query("download") !== undefined;
+  const res = await serveUpload(key, c.req.header("Range"), {
+    ...PUBLIC_HEADERS,
+    "Cache-Control": "no-store",
+    ...(download ? { "Content-Disposition": `attachment; filename="${makeKey(shared.name)}.mp4"` } : {}),
+  });
+  return res ?? c.text("Not found", 404, PUBLIC_HEADERS);
+});
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+/** A storage key from a file name, suffixed when another asset already has it. */
+async function uniqueKey(name: string): Promise<string> {
+  const key = makeKey(name || "file");
+  const clash = await get<{ id: string }>("SELECT id FROM assets WHERE key = ?", [key]);
+  if (!clash) return key;
+  const dot = key.lastIndexOf(".");
+  const suffix = lower8();
+  return dot > 0 ? `${key.slice(0, dot)}-${suffix}${key.slice(dot)}` : `${key}-${suffix}`;
+}
+
+function lower8(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(4)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export default app;

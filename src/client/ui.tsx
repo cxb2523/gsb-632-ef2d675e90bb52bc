@@ -1,0 +1,315 @@
+// Shared control recipes and the two shells both routes need (a dialog and an
+// empty state). Every value here is a token: no raw hex, no fixed px, so an
+// app or agency rebrands by overriding a custom property in styles.css and
+// every control below reflows.
+//
+// Buttons: 28px tall, 8px corners, one SOLID (ink) action per screen.
+// Everything else is secondary (white with a raised shadow ring) or ghost.
+
+import { useEffect, useRef } from "react";
+import * as RadixContextMenu from "@radix-ui/react-context-menu";
+import * as RadixPopover from "@radix-ui/react-popover";
+import { Command as CommandPrimitive } from "cmdk";
+import { ChevronDown } from "lucide-react";
+
+const btnBase =
+  "inline-flex items-center gap-1.5 h-7 rounded-sm text-button whitespace-nowrap " +
+  "disabled:opacity-50 disabled:pointer-events-none";
+
+/** The one solid action on a screen. A leading icon sits 2px tighter. */
+export const btnPrimary = `${btnBase} pl-1.5 pr-2 bg-primary text-on-primary hover:bg-primary-hover shadow-button`;
+/** The default for everything else: white, edged by a shadow ring not a border. */
+export const btnSecondary = `${btnBase} pl-1.5 pr-2 bg-surface text-foreground hover:bg-surface-sunken shadow-raised`;
+/** Cancel, toolbar view-state chips, row actions. */
+export const btnGhost = `${btnBase} px-2 text-muted hover:bg-surface-sunken hover:text-foreground`;
+/** Destructive: tint at rest, fills solid on hover. */
+export const btnDanger = `${btnBase} px-2 bg-danger-tint text-danger hover:bg-danger-solid hover:text-on-primary`;
+/** Icon-only control (row actions, transport). Square, so it stays optical. */
+export const btnIcon =
+  "inline-grid place-items-center w-7 h-7 rounded-sm text-muted hover:bg-surface-sunken hover:text-foreground " +
+  "disabled:opacity-40 disabled:pointer-events-none";
+
+/** A stretched button centres its content: the tighter leading-icon padding is
+ *  an optical correction that only applies when the button hugs its label. */
+export const stretch = "w-full justify-center px-2";
+
+/** A resting card: white, edged by an inset ring at 12px. Never a drop shadow. */
+export const card = "rounded-md bg-surface shadow-edge";
+
+// ── empty state ─────────────────────────────────────────────────────────────
+
+/** Never a bare "No data": say what this is and offer the way forward. An
+ *  empty state is never inside a card — an empty card reads as broken. */
+export function EmptyState({
+  icon,
+  title,
+  body,
+  action,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  body: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="grid place-items-center content-center gap-2 py-16 text-center">
+      <div className="text-faint">{icon}</div>
+      <div className="text-heading-3">{title}</div>
+      <p className="max-w-sm text-body-sm text-muted">{body}</p>
+      {action && <div className="mt-2">{action}</div>}
+    </div>
+  );
+}
+
+// ── dialog ──────────────────────────────────────────────────────────────────
+
+/** Keyboard hints live on the buttons — the cheapest way to teach the
+ *  shortcuts that make a tool fast. */
+export function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="ml-1 rounded-xs bg-surface-sunken px-1 text-fine text-faint">{children}</span>
+  );
+}
+
+/**
+ * Modal shell. The OVERLAY is the scroll container, so a tall body starts at
+ * the top and scrolls to its footer instead of clipping both ends. Escape
+ * closes; focus moves into the dialog on open.
+ */
+export function Dialog({
+  title,
+  icon,
+  description,
+  onClose,
+  children,
+  footer,
+  size = "md",
+}: {
+  title: string;
+  icon?: React.ReactNode;
+  description?: string;
+  onClose: () => void;
+  children?: React.ReactNode;
+  footer: React.ReactNode;
+  /** "lg" for a dialog that has to show a list and a preview side by side. */
+  size?: "md" | "lg";
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    ref.current?.querySelector<HTMLElement>("[data-autofocus]")?.focus();
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 overflow-y-auto bg-foreground/40"
+      onPointerDown={onClose}
+      role="presentation"
+    >
+      <div className="flex min-h-full items-center justify-center p-4">
+        <div
+          ref={ref}
+          role="dialog"
+          aria-modal="true"
+          aria-label={title}
+          className={`w-full ${size === "lg" ? "max-w-2xl" : "max-w-md"} rounded-lg bg-surface p-5 shadow-float`}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <h2 className="flex items-center gap-2 text-heading-2">
+            {icon}
+            {title}
+          </h2>
+          {description && <p className="mt-1 text-body-sm text-muted">{description}</p>}
+          {children}
+          <div className="mt-4 flex justify-end gap-2">{footer}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** A destructive confirm NAMES the object and says what is lost. Never
+ *  window.confirm — it cannot be styled, and an agent driving the browser
+ *  cannot answer it. */
+export function ConfirmDialog({
+  title,
+  body,
+  confirmLabel = "Delete",
+  onConfirm,
+  onClose,
+}: {
+  title: string;
+  body: string;
+  confirmLabel?: string;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog
+      title={title}
+      description={body}
+      onClose={onClose}
+      footer={
+        <>
+          <button className={btnGhost} onClick={onClose}>
+            Cancel <Kbd>esc</Kbd>
+          </button>
+          <button className={btnDanger} data-autofocus onClick={onConfirm}>
+            {confirmLabel}
+          </button>
+        </>
+      }
+    />
+  );
+}
+
+/**
+ * A right-click menu on the design tokens. Radix owns placement at the
+ * pointer, keyboard, focus and dismissal. It is only ever a shortcut: every
+ * action in one must also be reachable from a visible control, because an
+ * agent driving the app never right-clicks.
+ */
+export const ContextMenu = RadixContextMenu.Root;
+export const ContextMenuTrigger = RadixContextMenu.Trigger;
+
+export function ContextMenuContent({ children }: { children: React.ReactNode }) {
+  return (
+    <RadixContextMenu.Portal>
+      <RadixContextMenu.Content className="z-50 min-w-40 rounded-md bg-surface p-1 shadow-float">
+        {children}
+      </RadixContextMenu.Content>
+    </RadixContextMenu.Portal>
+  );
+}
+
+export function ContextMenuItem({
+  children,
+  onSelect,
+  danger = false,
+}: {
+  children: React.ReactNode;
+  onSelect: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <RadixContextMenu.Item
+      onSelect={onSelect}
+      className={`flex items-center gap-2 h-7 px-2 rounded-sm text-body-sm outline-none cursor-default select-none ${
+        danger ? "text-danger data-[highlighted]:bg-danger-tint" : "text-foreground data-[highlighted]:bg-surface-sunken"
+      }`}
+    >
+      {children}
+    </RadixContextMenu.Item>
+  );
+}
+
+// ── dropdown ────────────────────────────────────────────────────────────────
+
+/**
+ * Every dropdown is a popover holding a command list, never a native select:
+ * a select cannot take the tokens or show more than one line per option.
+ * Radix owns placement, focus and dismissal; cmdk owns the arrow keys and
+ * Enter. Add a search input only when the list is longer than a handful.
+ */
+export const Popover = RadixPopover.Root;
+export const PopoverTrigger = RadixPopover.Trigger;
+
+/**
+ * The face of a dropdown, in DESIGN.md's two kinds. A select that changes what
+ * the screen shows ("view") is the raised secondary-button shape at 28px and
+ * hugs its label; one that sets a value ("field") keeps the input shape so it
+ * lines up with the fields around it. The chevron is what tells a view select
+ * from a button, so it is always there. Wrap it in a PopoverTrigger (asChild);
+ * Radix sets data-state="open" on it while the list shows.
+ */
+export function SelectTrigger({
+  kind,
+  className = "",
+  children,
+  ...rest
+}: { kind: "view" | "field" } & React.ButtonHTMLAttributes<HTMLButtonElement> & {
+    ref?: React.Ref<HTMLButtonElement>;
+  }) {
+  const face =
+    kind === "view"
+      ? "inline-flex h-7 pl-2 pr-1.5 rounded-sm text-button whitespace-nowrap bg-surface text-foreground shadow-raised hover:bg-surface-sunken data-[state=open]:bg-surface-sunken"
+      : "field flex w-full";
+  return (
+    <button type="button" className={`${face} items-center gap-1.5 text-left cursor-pointer ${className}`} {...rest}>
+      {children}
+      <ChevronDown className="w-4 h-4 shrink-0 text-muted ml-auto" strokeWidth={1.5} />
+    </button>
+  );
+}
+
+export function PopoverContent({
+  children,
+  align = "start",
+  width = "w-(--radix-popover-trigger-width) min-w-64",
+}: {
+  children: React.ReactNode;
+  align?: "start" | "center" | "end";
+  /** Width classes; defaults to the trigger's width, as a dropdown should be. */
+  width?: string;
+}) {
+  return (
+    <RadixPopover.Portal>
+      <RadixPopover.Content
+        align={align}
+        sideOffset={4}
+        collisionPadding={8}
+        className={`z-50 ${width} rounded-md bg-surface shadow-float outline-none`}
+      >
+        {children}
+      </RadixPopover.Content>
+    </RadixPopover.Portal>
+  );
+}
+
+/** `chosen` is the current option's value: the list opens with it highlighted. */
+export function Command({ label, chosen, children }: { label: string; chosen?: string; children: React.ReactNode }) {
+  return (
+    <CommandPrimitive label={label} loop defaultValue={chosen}>
+      <CommandPrimitive.List className="scroll-slim max-h-96 overflow-y-auto p-1">{children}</CommandPrimitive.List>
+    </CommandPrimitive>
+  );
+}
+
+export function CommandGroup({ heading, children }: { heading: string; children: React.ReactNode }) {
+  return (
+    <CommandPrimitive.Group
+      heading={heading}
+      className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-fine [&_[cmdk-group-heading]]:text-faint"
+    >
+      {children}
+    </CommandPrimitive.Group>
+  );
+}
+
+export function CommandItem({
+  value,
+  onSelect,
+  chosen = false,
+  children,
+}: {
+  /** Unique within the list: cmdk tracks the highlighted item by it. */
+  value: string;
+  onSelect: () => void;
+  /** The current option. It is a highlight in medium weight, never a tick (DESIGN.md). */
+  chosen?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <CommandPrimitive.Item
+      value={value}
+      onSelect={onSelect}
+      aria-current={chosen || undefined}
+      className={`flex items-center gap-2 min-h-8 px-2 py-1 rounded-sm text-body-sm text-foreground cursor-pointer select-none outline-none data-[selected=true]:bg-surface-sunken ${chosen ? "bg-surface-sunken font-medium" : ""}`}
+    >
+      {children}
+    </CommandPrimitive.Item>
+  );
+}
