@@ -34,8 +34,14 @@ libraryHighlights.get("/", async (c) => {
 libraryHighlights.delete("/:id", async (c) => {
   // Keep a tombstone: regeneration or an interrupted legacy backfill must not
   // resurrect a selection someone explicitly removed. Existing edits are copies.
-  await run("UPDATE library_highlights SET deleted_at = datetime('now') WHERE id = ?", [c.req.param("id")]);
-  return c.json({ ok: true });
+  // The tombstone is durable (it lives in the database, so it holds across
+  // restarts) and observable (the caller gets it back, and it stays queryable).
+  const id = c.req.param("id");
+  const existing = await get<{ id: string; deleted_at: string | null }>("SELECT id, deleted_at FROM library_highlights WHERE id = ?", [id]);
+  if (!existing) return c.json({ error: "not_found", detail: "No shared highlight with this id." }, 404);
+  if (!existing.deleted_at) await run("UPDATE library_highlights SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL", [id]);
+  const tombstone = await get<{ id: string; deleted_at: string }>("SELECT id, deleted_at FROM library_highlights WHERE id = ?", [id]);
+  return c.json({ ok: true, id: tombstone!.id, deleted_at: tombstone!.deleted_at });
 });
 
 libraryHighlights.post("/projects", async (c) => {

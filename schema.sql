@@ -307,12 +307,27 @@ CREATE INDEX IF NOT EXISTS library_highlights_asset ON library_highlights(asset_
 
 -- Publish in the same transaction as the suggestion: an asset deletion claim
 -- or detached footage cannot race a background result into the shared catalog.
+-- Automatic publishing (analysis, backfill) is INSERT OR IGNORE: a tombstoned
+-- row (deleted_at set) blocks the same (asset, kind, src_in, src_out) from
+-- ever coming back on its own. A person's own pick (origin 'person') is an
+-- explicit re-publish and restores the row instead (publish_highlight_restore).
 CREATE TRIGGER IF NOT EXISTS publish_highlight_insert AFTER INSERT ON footage_highlights
+WHEN NEW.origin != 'person'
 BEGIN
   INSERT OR IGNORE INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
   SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
   FROM project_footage f JOIN assets a ON a.id = f.asset_id
   WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS publish_highlight_restore AFTER INSERT ON footage_highlights
+WHEN NEW.origin = 'person'
+BEGIN
+  INSERT INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
+  SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0
+  ON CONFLICT(asset_id, kind, src_in, src_out) DO UPDATE SET
+    deleted_at = NULL, text = excluded.text, speaker = excluded.speaker, source_project_id = excluded.source_project_id;
 END;
 CREATE TRIGGER IF NOT EXISTS publish_highlight_edit AFTER UPDATE OF src_in, src_out, text, speaker ON footage_highlights
 BEGIN
@@ -478,3 +493,27 @@ ALTER TABLE ask_jobs ADD COLUMN reverted_at TEXT;
 -- highlights and its conversation. NULL: a project (and its first video).
 ALTER TABLE edit_projects ADD COLUMN parent_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_edit_projects_parent ON edit_projects(parent_id);
+
+-- Existing installs: replace the publish trigger with the origin-split pair
+-- above (automatic publishing never resurrects a tombstone; a person's own
+-- pick explicitly re-publishes it). Fresh schemas already have this pair, so
+-- the drop-and-recreate is a no-op for them.
+DROP TRIGGER IF EXISTS publish_highlight_insert;
+CREATE TRIGGER IF NOT EXISTS publish_highlight_insert AFTER INSERT ON footage_highlights
+WHEN NEW.origin != 'person'
+BEGIN
+  INSERT OR IGNORE INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
+  SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0;
+END;
+CREATE TRIGGER IF NOT EXISTS publish_highlight_restore AFTER INSERT ON footage_highlights
+WHEN NEW.origin = 'person'
+BEGIN
+  INSERT INTO library_highlights (id, asset_id, kind, src_in, src_out, text, speaker, source_project_id, created_at)
+  SELECT NEW.id, a.id, NEW.kind, NEW.src_in, NEW.src_out, NEW.text, NEW.speaker, NEW.project_id, NEW.created_at
+  FROM project_footage f JOIN assets a ON a.id = f.asset_id
+  WHERE f.id = NEW.footage_id AND f.project_id = NEW.project_id AND f.status = 'ready' AND a.deleting = 0
+  ON CONFLICT(asset_id, kind, src_in, src_out) DO UPDATE SET
+    deleted_at = NULL, text = excluded.text, speaker = excluded.speaker, source_project_id = excluded.source_project_id;
+END;

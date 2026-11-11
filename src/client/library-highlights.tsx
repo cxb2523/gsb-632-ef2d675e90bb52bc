@@ -60,6 +60,10 @@ export function SharedHighlights({ onAdd, navigate }: {
       await api.send("DELETE", `/api/highlights/${h.id}`);
       setItems(prev => prev.filter(p => p.id !== h.id));
       setSelected(prev => { const next = new Set(prev); next.delete(h.id); return next; });
+      // The removed row was inside the fetched window, so every catalog row
+      // after it shifts up by one. Keeping next_offset in step means Load more
+      // neither skips a row nor shows one twice.
+      setOffset(prev => (prev === null ? null : Math.max(0, prev - 1)));
     } catch (e) { setError((e as Error).message); }
   };
   return <div className="min-w-0">
